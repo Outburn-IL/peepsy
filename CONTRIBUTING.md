@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Peepsy! This guide will help you 
 
 ### Prerequisites
 
-- Node.js 16.0.0 or higher
+- Node.js 18.0.0 or higher
 - npm 7.0.0 or higher
 - Git
 

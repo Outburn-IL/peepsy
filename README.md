@@ -21,6 +21,11 @@ Peepsy simplifies complex multi-process architectures by providing a clean, prom
 - 🔧 **TypeScript Support**: Full type definitions included
 - 📋 **Priority Queues**: Handle requests with different priorities
 - 🔒 **Graceful Shutdown**: Clean process termination with proper resource cleanup
+ - ❤️ **Heartbeats + Auto-Restart**: Children emit heartbeats; master detects missed beats and can auto-restart
+ - 🧯 **Strict Master-Side Queuing**: Group `maxConcurrency` enforced via queue, dispatches up to capacity
+ - 🧭 **Structured Errors (Optional)**: Responses may include `errorPayload` alongside legacy `error` string
+ - 🩺 **Health Helpers + Events**: Expose `getUnhealthyProcesses()` and emit `heartbeat-missed`/`auto-restart`
+ - ⚙️ **Restart Toggles**: Disable auto-restart per group or per target for controlled recovery
 
 ## 📦 Installation
 
@@ -28,7 +33,12 @@ Peepsy simplifies complex multi-process architectures by providing a clean, prom
 npm install peepsy
 ```
 
-**Requirements**: Node.js 16.0.0 or higher
+**Requirements**: Node.js 18.0.0 or higher
+
+Note on heartbeat compatibility:
+- Heartbeat relies on Node's IPC (`process.send`) from `child_process.fork` and timer `unref()` behavior.
+- Use Node 18+ for consistent heartbeat timing and clean teardown semantics.
+- Ensure workers are spawned via `fork` (with an IPC channel); without IPC, heartbeats cannot be delivered.
 
 ## 🚀 Quick Start
 
@@ -121,9 +131,53 @@ async function requestMasterInfo() {
 
 // Call master periodically
 setInterval(requestMasterInfo, 30000);
+
+// Optional: limit concurrency in concurrent mode
+// const worker = new PeepsyChild('concurrent', { maxConcurrency: 32 });
+// Excess requests are queued and drained up to the cap.
 ```
 
 ## 🔧 Advanced Usage
+
+### Usage: Heartbeat and Auto-Restart
+
+```javascript
+import { PeepsyMaster } from 'peepsy';
+
+// Configure master with heartbeat monitoring
+const master = new PeepsyMaster({
+  heartbeatIntervalMs: 2000,        // child sends HEARTBEAT every 2s
+  heartbeatMissThreshold: 3         // mark unhealthy if > ~6s without heartbeat
+});
+
+// Node version guidance:
+// - Node 18+ required for stable timer/IPC semantics.
+// - Heartbeat requires IPC (child must be spawned with `fork`).
+
+// Spawn children; associate to a group to apply group-level toggles
+master.spawnChild('w1', './worker.js', 'concurrent', 'api');
+master.spawnChild('w2', './worker.js', 'concurrent', 'api');
+
+// Optionally disable auto-restart per group
+master.configureGroup('api', { disableAutoRestart: false, maxConcurrency: 8 });
+
+// Listen to health events
+master.on('heartbeat-missed', ({ target, timestamp }) => {
+  console.warn(`[health] missed heartbeat from ${target} at ${new Date(timestamp).toISOString()}`);
+});
+master.on('auto-restart', ({ target, code, signal }) => {
+  console.warn(`[health] attempting auto-restart of ${target} (code=${code}, signal=${signal})`);
+});
+
+// Query health status
+const unhealthy = master.getUnhealthyProcesses();
+if (unhealthy.length) {
+  console.log('Unhealthy processes:', unhealthy);
+}
+
+// Per-target toggle is supported via spawn metadata (group toggle shown above)
+// Auto-restart is disabled if group or target sets disableAutoRestart: true.
+```
 
 ### Load Balancing Strategies
 
@@ -140,13 +194,17 @@ master.spawnChild('worker3', './worker.js', 'concurrent', 'api-group');
 // Configure group strategy (round-robin is default)
 master.configureGroup('api-group', { 
   strategy: 'least-busy',  // 'round-robin', 'random', or 'least-busy'
-  maxConcurrency: 10 
+  maxConcurrency: 10       // cap total concurrent in-flight requests in the group
 });
 
 // Requests are automatically distributed
 for (let i = 0; i < 100; i++) {
   master.sendRequest('processRequest', 'api-group', { requestId: i });
 }
+
+// Guidance:
+// - Use group maxConcurrency to cap total in-flight requests across targets.
+// - Use child maxConcurrency in 'concurrent' mode to cap per-process concurrency.
 ```
 
 ### Error Handling and Retries
@@ -177,6 +235,41 @@ try {
     console.log('Other error:', error.message);
   }
 }
+
+// Structured error payloads (optional)
+// In addition to the legacy `error` string, responses may include
+// `errorPayload: { name, message, code?, stack? }` for richer diagnostics.
+// This remains backward-compatible with existing handlers/tests.
+```
+
+### Typed API Examples
+
+```typescript
+import { PeepsyMaster, PeepsyChild } from 'peepsy';
+
+// Master: typed sendRequest + handler
+const master = new PeepsyMaster();
+master.registerHandler<{ id: string }, { exists: boolean }>('check', async (data) => {
+  return { exists: Boolean(data.id) };
+});
+
+const res = await master.sendRequest<{ a: number; b: number }, { result: number }>(
+  'add',
+  'worker1',
+  { a: 1, b: 2 }
+);
+console.log(res.status, res.data?.result);
+
+// Child: typed sendRequest + handler
+const child = new PeepsyChild('sequential');
+child.registerHandler<{ task: string }, { done: boolean }>('doTask', async (data) => {
+  // ...
+  return { done: true };
+});
+
+const info = await child.sendRequest<{ who: string }, { ok: boolean }>('getMasterInfo', {
+  who: 'worker',
+});
 ```
 
 ### Process Monitoring
@@ -187,7 +280,7 @@ const stats = master.getProcessStats('worker1');
 console.log('Worker stats:', {
   requestsHandled: stats.requestsHandled,
   requestsActive: stats.requestsActive,
-  averageResponseTime: stats.averageResponseTime,
+  averageResponseTime: stats.averageResponseTime, // EMA smoothed
   errors: stats.errors
 });
 
@@ -206,6 +299,21 @@ console.log('Active requests:', master.getActiveRequestsCount());
 if (master.isProcessAlive('worker1')) {
   console.log('Worker1 is running');
 }
+
+// Heartbeats and auto-restart
+// Children emit HEARTBEAT messages periodically (configurable via PeepsyOptions):
+// { heartbeatIntervalMs, heartbeatMissThreshold }
+// If a child misses heartbeats beyond the threshold, master marks it unhealthy
+// and attempts an auto-restart using the original spawn configuration.
+// You can disable auto-restart per group or per target.
+
+// Events
+master.on('heartbeat-missed', ({ target, timestamp }) => {
+  // handle missed heartbeat
+});
+master.on('auto-restart', ({ target, code, signal }) => {
+  // observe auto-restart attempts
+});
 ```
 
 ### Custom Logging
@@ -226,6 +334,22 @@ const master = new PeepsyMaster({
   // or use built-in logger with level
   // logger: new DefaultLogger('debug')
 });
+
+// Options also support:
+// - timeout
+// - maxRetries + retryDelay (master)
+// Child options additionally support:
+// - retryDelay (for child-initiated requests)
+// - maxConcurrency (concurrent mode cap)
+
+### Protocol Notes
+
+- Request envelope: `{ type: 'REQUEST', id, action, data, timeout }`
+- Response envelope: `{ type: 'RESPONSE', id, status, data?, error? }`
+- Optional structured error: `errorPayload?: { name, message, code?, stack? }`
+- Master currently sends `{ type: 'REQUEST', request, timeout }` for broader compatibility.
+- Child accepts both legacy nested shape and the unified envelope.
+ - Master maps structured errors to legacy `error` string for backward compatibility.
 ```
 
 ### Graceful Shutdown
@@ -242,6 +366,14 @@ process.on('SIGINT', async () => {
 
 // Or shutdown specific workers
 await master.shutdownChild('worker1', 10000); // 10 second timeout
+
+// Concurrency caps
+// Master enforces group `maxConcurrency` using a strict per-group queue
+// (no busy-wait). Requests over capacity are queued and dispatched as capacity frees.
+
+// Worker shutdown behavior
+// Children perform graceful teardown without forcing process.exit(0),
+// disconnecting IPC and allowing natural exit to avoid test runner warnings.
 ```
 
 ## 📚 API Reference
