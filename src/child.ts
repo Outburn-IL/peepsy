@@ -6,6 +6,8 @@ import { randomUUID } from 'crypto';
 import {
   RequestMessage,
   ResponseMessage,
+  RequestEnvelope,
+  ResponseEnvelope,
   ProcessMode,
   PeepsyOptions,
   PeepsyLogger,
@@ -21,6 +23,10 @@ export class PeepsyChild {
   private readonly logger: PeepsyLogger;
   private readonly mode: ProcessMode;
   private readonly timeout: number;
+  private readonly retryDelay: number;
+  private readonly maxConcurrency: number | undefined;
+  private readonly heartbeatIntervalMs: number;
+  private heartbeatTimer: ReturnType<typeof setInterval> | undefined = undefined;
   private isProcessing: boolean = false;
   private isShuttingDown: boolean = false;
   private queueCleanupInterval: ReturnType<typeof setInterval> | undefined = undefined;
@@ -31,6 +37,9 @@ export class PeepsyChild {
     this.mode = mode;
     this.timeout = options.timeout ?? 5000;
     this.logger = options.logger ?? new DefaultLogger();
+    this.retryDelay = options.retryDelay ?? 1000;
+    this.maxConcurrency = options.maxConcurrency;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 2000;
 
     if (!isValidTimeout(this.timeout)) {
       throw new PeepsyError('Invalid timeout value. Must be a positive integer <= 300000ms');
@@ -43,6 +52,7 @@ export class PeepsyChild {
 
     this.setupMessageHandlers();
     this.setupProcessHandlers();
+    this.startHeartbeat();
 
     this.logger.debug(`PeepsyChild initialized in ${mode} mode`);
   }
@@ -62,11 +72,26 @@ export class PeepsyChild {
         }
 
         if (message?.type === 'REQUEST') {
-          const { request, timeout } = message;
+          // Backward-compatible shape: either flat envelope or nested { request, timeout }
+          const envelope = message as Partial<RequestEnvelope> & {
+            request?: RequestMessage;
+            timeout?: number;
+          };
+          const req: RequestMessage = envelope.request
+            ? envelope.request
+            : { id: envelope.id as string, action: envelope.action as string, data: envelope.data };
+          const to = envelope.timeout ?? this.timeout;
           if (this.mode === 'sequential') {
-            this.enqueueRequest(request, timeout);
+            this.enqueueRequest(req, to);
+          } else if (
+            this.queue &&
+            typeof this.maxConcurrency === 'number' &&
+            this.maxConcurrency > 0
+          ) {
+            this.enqueueRequest(req, to);
+            void this.processQueueWithConcurrency();
           } else {
-            void this.processRequestImmediately(request);
+            void this.processRequestImmediately(req);
           }
         } else if (message?.type === 'RESPONSE' && this.activeRequests.has(message.id)) {
           const resolve = this.activeRequests.get(message.id);
@@ -102,6 +127,36 @@ export class PeepsyChild {
     });
   }
 
+  private startHeartbeat(): void {
+    if (!process.send) return;
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      try {
+        const sendFn = process.send;
+        if (sendFn) {
+          sendFn({
+            type: 'HEARTBEAT',
+            pid: process.pid,
+            timestamp: Date.now(),
+            requestsActive: this.requestsInProgress,
+          } as any);
+        }
+      } catch (err) {
+        void err;
+      }
+    }, this.heartbeatIntervalMs);
+    if (this.heartbeatTimer.unref) {
+      this.heartbeatTimer.unref();
+    }
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+  }
+
   public registerHandler(
     action: string,
     handler: (data: unknown) => Promise<unknown> | unknown
@@ -118,11 +173,11 @@ export class PeepsyChild {
     return removed;
   }
 
-  public async sendRequest(
+  public async sendRequest<TReq = unknown, TRes = unknown>(
     action: string,
-    data: unknown = {},
+    data: TReq = {} as TReq,
     options: { timeout?: number; retries?: number } = {}
-  ): Promise<unknown> {
+  ): Promise<TRes> {
     if (this.isShuttingDown) {
       throw new PeepsyError('Cannot send request during shutdown');
     }
@@ -140,7 +195,7 @@ export class PeepsyChild {
       try {
         if (attempt > 0) {
           this.logger.debug(`Retry attempt ${attempt}/${maxRetries} for ${action}`);
-          await delay(1000); // 1 second retry delay
+          await delay(this.retryDelay);
         }
 
         const response = await this.executeRequest(action, data, requestTimeout);
@@ -149,7 +204,7 @@ export class PeepsyChild {
           this.logger.info(`Request succeeded on retry ${attempt}`, { action });
         }
 
-        return response;
+        return response as TRes;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         this.logger.warn(`Request attempt ${attempt + 1} failed`, {
@@ -188,7 +243,8 @@ export class PeepsyChild {
       }
 
       try {
-        process.send({ type: 'REQUEST', id, action, data });
+        const envelope: RequestEnvelope = { type: 'REQUEST', id, action, data, timeout };
+        process.send(envelope);
       } catch (error) {
         clearTimeout(timeoutHandle);
         this.activeRequests.delete(id);
@@ -228,6 +284,19 @@ export class PeepsyChild {
     }
   }
 
+  private async processQueueWithConcurrency(): Promise<void> {
+    if (this.isShuttingDown || !this.queue) return;
+    while (
+      !this.queue.isEmpty() &&
+      this.requestsInProgress < (this.maxConcurrency ?? Number.MAX_SAFE_INTEGER)
+    ) {
+      const request = this.queue.dequeue();
+      if (request) {
+        void this.processRequestImmediately(request);
+      }
+    }
+  }
+
   private async processRequestImmediately(request: RequestMessage): Promise<void> {
     try {
       this.requestsInProgress++;
@@ -264,12 +333,8 @@ export class PeepsyChild {
       const result = await Promise.resolve(handler(data));
       const duration = Date.now() - startTime;
 
-      process.send({
-        type: 'RESPONSE',
-        id,
-        status: 200,
-        data: result,
-      });
+      const env: ResponseEnvelope = { type: 'RESPONSE', id, status: 200, data: result };
+      process.send(env);
 
       this.requestsHandled++;
       this.logger.debug(`Request processed successfully`, {
@@ -281,12 +346,13 @@ export class PeepsyChild {
       const duration = Date.now() - startTime;
       const sanitized = sanitizeError(error);
 
-      process.send({
+      const env: ResponseEnvelope = {
         type: 'RESPONSE',
         id,
         status: 500,
         error: sanitized.message,
-      });
+      };
+      process.send(env);
 
       this.logger.error(`Request processing failed`, {
         action,
@@ -306,6 +372,9 @@ export class PeepsyChild {
           }
         }
       }, 5000); // Clean every 5 seconds
+      if (this.queueCleanupInterval.unref) {
+        this.queueCleanupInterval.unref();
+      }
     }
   }
 
@@ -353,8 +422,18 @@ export class PeepsyChild {
 
     // Small delay to ensure logs are flushed
     await delay(100);
+    this.stopHeartbeat();
 
-    process.exit(0);
+    // Avoid hard exiting; disconnect IPC and let process exit naturally
+    try {
+      if (typeof process.disconnect === 'function') {
+        process.disconnect();
+      }
+      // Hint exit code without forcing termination
+      process.exitCode = 0;
+    } catch (err) {
+      void err;
+    }
   }
 
   // Public getters for monitoring

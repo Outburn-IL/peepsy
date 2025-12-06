@@ -20,9 +20,40 @@ export interface ResponseMessage {
   readonly error?: string;
 }
 
+// Unified IPC envelope types for wire protocol
+export interface RequestEnvelope {
+  readonly type: 'REQUEST';
+  readonly id: string;
+  readonly action: string;
+  readonly data?: unknown;
+  readonly timeout?: number;
+}
+
+export interface ResponseEnvelope {
+  readonly type: 'RESPONSE';
+  readonly id: string;
+  readonly status: number;
+  readonly data?: unknown;
+  readonly error?: string;
+  readonly errorPayload?: PeepsyErrorPayload;
+}
+
+// Rich, serializable error payload used across processes
+export interface PeepsyErrorPayload {
+  readonly name: string;
+  readonly message: string;
+  readonly code?: string;
+  readonly details?: unknown;
+  readonly stack?: string;
+}
+
 export interface ChildProcessEntry {
   readonly child: ChildProcess;
   readonly mode: ProcessMode;
+  readonly scriptPath?: string;
+  readonly groupId?: string;
+  readonly spawnOptions?: SpawnOptions;
+  readonly disableAutoRestart?: boolean;
 }
 
 export interface ProcessConfig {
@@ -40,6 +71,7 @@ export interface SpawnOptions {
 export interface GroupConfig {
   readonly strategy?: 'round-robin' | 'random' | 'least-busy';
   readonly maxConcurrency?: number;
+  readonly disableAutoRestart?: boolean;
 }
 
 export type ProcessMode = 'sequential' | 'concurrent';
@@ -57,6 +89,9 @@ export interface PeepsyOptions {
   readonly logger?: PeepsyLogger;
   readonly maxRetries?: number;
   readonly retryDelay?: number;
+  readonly maxConcurrency?: number; // Child-side concurrency cap (concurrent mode)
+  readonly heartbeatIntervalMs?: number; // child heartbeat cadence
+  readonly heartbeatMissThreshold?: number; // tolerated missed heartbeats before unhealthy
 }
 
 export interface QueueItem<T> {
@@ -72,6 +107,16 @@ export interface ProcessStats {
   readonly averageResponseTime: number;
   readonly lastActivity: number;
   readonly errors: number;
+  readonly lastHeartbeatAt?: number;
+  readonly status?: 'healthy' | 'unhealthy' | 'restarting';
+}
+
+// Heartbeat message sent from child to master
+export interface HeartbeatMessage {
+  readonly type: 'HEARTBEAT';
+  readonly pid: number;
+  readonly timestamp: number;
+  readonly requestsActive?: number;
 }
 
 export interface GroupStats {

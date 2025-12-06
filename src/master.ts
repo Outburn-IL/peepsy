@@ -6,8 +6,10 @@ import { ChildProcess, fork } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import {
-  RequestMessage,
   ResponseMessage,
+  RequestEnvelope,
+  ResponseEnvelope,
+  RequestMessage,
   ChildProcessEntry,
   ProcessMode,
   SpawnOptions,
@@ -24,17 +26,31 @@ import {
 import { DefaultLogger, delay, isValidTimeout, sanitizeError } from './utils';
 
 export class PeepsyMaster extends EventEmitter {
+  private static processListenersRegistered: boolean = false;
   private readonly processes: Map<string, ChildProcessEntry> = new Map();
   private readonly groups: Map<string, { targets: string[]; config: GroupConfig }> = new Map();
   private readonly roundRobinCounters: Map<string, number> = new Map();
   private readonly activeRequests: Map<string, (response: ResponseMessage) => void> = new Map();
-  private readonly handlers: Map<string, (data: unknown) => Promise<unknown> | unknown> = new Map();
+  private readonly groupQueues: Map<
+    string,
+    Array<{
+      action: string;
+      data: unknown;
+      timeout: number;
+      resolve: (r: ResponseMessage) => void;
+      reject: (e: Error) => void;
+    }>
+  > = new Map();
+  private readonly handlers: Map<string, (data: any) => Promise<any> | any> = new Map();
   private readonly processStats: Map<string, ProcessStats> = new Map();
   private readonly logger: PeepsyLogger;
   private readonly timeout: number;
   private readonly maxRetries: number;
   private readonly retryDelay: number;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatMissThreshold: number;
   private isShuttingDown: boolean = false;
+  private healthMonitor: ReturnType<typeof setInterval> | undefined = undefined;
 
   constructor(options: PeepsyOptions = {}) {
     super();
@@ -42,15 +58,27 @@ export class PeepsyMaster extends EventEmitter {
     this.maxRetries = options.maxRetries ?? 0;
     this.retryDelay = options.retryDelay ?? 1000;
     this.logger = options.logger ?? new DefaultLogger();
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 2000;
+    this.heartbeatMissThreshold = options.heartbeatMissThreshold ?? 3;
 
     if (!isValidTimeout(this.timeout)) {
       throw new PeepsyError('Invalid timeout value. Must be a positive integer <= 300000ms');
     }
 
-    // Set up cleanup on process termination
-    process.on('SIGINT', () => this.gracefulShutdown());
-    process.on('SIGTERM', () => this.gracefulShutdown());
-    process.on('beforeExit', () => this.gracefulShutdown());
+    // Set up cleanup on process termination (register once across instances)
+    if (!PeepsyMaster.processListenersRegistered) {
+      process.on('SIGINT', () => this.gracefulShutdown());
+      process.on('SIGTERM', () => this.gracefulShutdown());
+      // Avoid beforeExit handler which can keep Jest workers alive
+      // Prevent MaxListeners warnings in test environments creating many masters
+      if (typeof process.setMaxListeners === 'function') {
+        process.setMaxListeners(0);
+      }
+      PeepsyMaster.processListenersRegistered = true;
+    }
+
+    // Start health monitor to check heartbeats
+    this.startHealthMonitor();
   }
 
   public spawnChild(
@@ -77,7 +105,17 @@ export class PeepsyMaster extends EventEmitter {
       if (options.env) forkOptions.env = { ...process.env, ...options.env };
 
       const child = fork(scriptPath, [], forkOptions);
-      const processEntry: ChildProcessEntry = { child, mode };
+      if (typeof child.unref === 'function') {
+        // Allow Jest to exit without waiting on child process handles
+        child.unref();
+      }
+      const processEntry: ChildProcessEntry = {
+        child,
+        mode,
+        scriptPath,
+        spawnOptions: options,
+        ...(groupId ? { groupId } : {}),
+      };
 
       this.processes.set(target, processEntry);
       this.initializeProcessStats(target);
@@ -98,11 +136,11 @@ export class PeepsyMaster extends EventEmitter {
     }
   }
 
-  public registerHandler(
+  public registerHandler<TReq = unknown, TRes = unknown>(
     action: string,
-    handler: (data: unknown) => Promise<unknown> | unknown
+    handler: (data: TReq) => Promise<TRes> | TRes
   ): void {
-    this.handlers.set(action, handler);
+    this.handlers.set(action, handler as unknown as (data: any) => Promise<any> | any);
     this.logger.debug(`Handler registered for action: ${action}`);
   }
 
@@ -114,12 +152,12 @@ export class PeepsyMaster extends EventEmitter {
     return removed;
   }
 
-  public async sendRequest(
+  public async sendRequest<TReq = unknown, TRes = unknown>(
     action: string,
     targetOrGroup: string,
-    data: unknown = {},
+    data: TReq = {} as TReq,
     options: { timeout?: number; retries?: number } = {}
-  ): Promise<ResponseMessage> {
+  ): Promise<{ status: number; data?: TRes; error?: string; id: string }> {
     const requestTimeout = options.timeout ?? this.timeout;
     const maxRetries = options.retries ?? this.maxRetries;
 
@@ -144,7 +182,7 @@ export class PeepsyMaster extends EventEmitter {
           this.logger.info(`Request succeeded on retry ${attempt}`, { action, targetOrGroup });
         }
 
-        return response;
+        return response as unknown as { status: number; data?: TRes; error?: string; id: string };
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         this.logger.warn(`Request attempt ${attempt + 1} failed`, {
@@ -169,6 +207,20 @@ export class PeepsyMaster extends EventEmitter {
 
       try {
         if (this.groups.has(targetOrGroup)) {
+          // Enforce group maxConcurrency via queue
+          const group = this.groups.get(targetOrGroup)!;
+          const maxConcurrency = group.config.maxConcurrency;
+          if (typeof maxConcurrency === 'number' && maxConcurrency > 0) {
+            const active = group.targets.reduce(
+              (sum, t) => sum + (this.processStats.get(t)?.requestsActive ?? 0),
+              0
+            );
+            if (active >= maxConcurrency) {
+              if (!this.groupQueues.has(targetOrGroup)) this.groupQueues.set(targetOrGroup, []);
+              this.groupQueues.get(targetOrGroup)!.push({ action, data, timeout, resolve, reject });
+              return; // will be dispatched when capacity frees
+            }
+          }
           processEntry = this.getChildForGroup(targetOrGroup);
         } else {
           processEntry = this.processes.get(targetOrGroup);
@@ -219,14 +271,23 @@ export class PeepsyMaster extends EventEmitter {
     child.on('message', (message: any) => {
       try {
         if (message?.type === 'REQUEST') {
-          this.handleChildRequest(message, child);
+          this.handleChildRequest(message as RequestEnvelope, child);
         } else if (message?.type === 'RESPONSE' && this.activeRequests.has(message.id)) {
           const resolve = this.activeRequests.get(message.id);
           if (resolve) {
-            resolve(message);
+            const env = message as ResponseEnvelope;
+            const errStr = env.error ?? env.errorPayload?.message;
+            const mapped: ResponseMessage = errStr
+              ? { id: env.id, status: env.status, data: env.data, error: errStr }
+              : { id: env.id, status: env.status, data: env.data };
+            resolve(mapped);
             this.activeRequests.delete(message.id);
             this.updateProcessStats(target, { requestsActive: -1 });
+            this.maybeDispatchQueued(target);
           }
+        } else if (message?.type === 'HEARTBEAT') {
+          const ts = message.timestamp ?? Date.now();
+          this.updateProcessStats(target, { lastHeartbeatAt: ts, lastActivity: ts });
         }
       } catch (error) {
         this.logger.error(`Error handling message from child ${target}`, error);
@@ -246,7 +307,30 @@ export class PeepsyMaster extends EventEmitter {
 
     child.on('exit', (code: number | null, signal: string | null) => {
       this.logger.info(`Child process exited: ${target}`, { code, signal, pid: child.pid });
+      const prev = this.processes.get(target);
       this.cleanupProcess(target);
+      if (!this.isShuttingDown && prev?.scriptPath) {
+        const groupId = prev.groupId;
+        const groupCfg = groupId ? this.groups.get(groupId)?.config : undefined;
+        const disableAutoRestart = prev.disableAutoRestart || groupCfg?.disableAutoRestart;
+        try {
+          if (!disableAutoRestart) {
+            this.logger.warn(`Auto-restarting child ${target}`);
+            this.emit('auto-restart', { target, code, signal });
+            this.spawnChild(
+              target,
+              prev.scriptPath,
+              prev.mode,
+              prev.groupId,
+              prev.spawnOptions ?? {}
+            );
+          } else {
+            this.logger.warn(`Auto-restart disabled for ${target}`);
+          }
+        } catch (err) {
+          this.logger.error(`Failed to auto-restart child ${target}`, err);
+        }
+      }
     });
 
     child.on('disconnect', () => {
@@ -254,7 +338,29 @@ export class PeepsyMaster extends EventEmitter {
     });
   }
 
-  private handleChildRequest(message: any, child: ChildProcess): void {
+  // Attempt to dispatch the next queued request for any group containing the freed target
+  private maybeDispatchQueued(targetFreed: string): void {
+    for (const [groupId, group] of this.groups) {
+      if (!group.targets.includes(targetFreed)) continue;
+      const queue = this.groupQueues.get(groupId);
+      const maxConcurrency = group.config.maxConcurrency ?? 0;
+      if (!queue || queue.length === 0 || maxConcurrency <= 0) continue;
+      while (queue.length > 0) {
+        const active = group.targets.reduce(
+          (sum, t) => sum + (this.processStats.get(t)?.requestsActive ?? 0),
+          0
+        );
+        if (active >= maxConcurrency) break;
+        const next = queue.shift();
+        if (!next) break;
+        void this.executeRequest(next.action, groupId, next.data, next.timeout)
+          .then(next.resolve)
+          .catch(next.reject);
+      }
+    }
+  }
+
+  private handleChildRequest(message: RequestEnvelope, child: ChildProcess): void {
     const { id, action, data } = message;
     const target = this.getTargetFromChild(child);
 
@@ -262,25 +368,35 @@ export class PeepsyMaster extends EventEmitter {
       const handler = this.handlers.get(action)!;
       Promise.resolve(handler(data))
         .then(response => {
-          child.send({ type: 'RESPONSE', id, status: 200, data: response });
+          const envelope: ResponseEnvelope = { type: 'RESPONSE', id, status: 200, data: response };
+          child.send(envelope);
         })
         .catch(error => {
           const sanitized = sanitizeError(error);
-          child.send({
+          const envelope: ResponseEnvelope = {
             type: 'RESPONSE',
             id,
             status: 500,
             error: sanitized.message,
-          });
+            errorPayload: sanitized.stack
+              ? { name: 'Error', message: sanitized.message, stack: sanitized.stack }
+              : { name: 'Error', message: sanitized.message },
+          };
+          child.send(envelope);
           this.logger.error(`Handler error for action ${action}`, sanitized);
         });
     } else {
-      child.send({
+      const envelope: ResponseEnvelope = {
         type: 'RESPONSE',
         id,
         status: 404,
         error: `No handler registered for action: ${action}`,
-      });
+        errorPayload: {
+          name: 'PeepsyNotFoundError',
+          message: `No handler registered for action: ${action}`,
+        },
+      };
+      child.send(envelope);
       this.logger.warn(`No handler for action: ${action}`, { target });
     }
   }
@@ -295,15 +411,17 @@ export class PeepsyMaster extends EventEmitter {
     let targetIndex: number;
 
     switch (strategy) {
-      case 'round-robin':
+      case 'round-robin': {
         const counter = this.roundRobinCounters.get(groupId) ?? 0;
         targetIndex = counter % group.targets.length;
         this.roundRobinCounters.set(groupId, counter + 1);
         break;
+      }
 
-      case 'random':
+      case 'random': {
         targetIndex = Math.floor(Math.random() * group.targets.length);
         break;
+      }
 
       case 'least-busy': {
         targetIndex = this.getLeastBusyProcessIndex(group.targets);
@@ -365,12 +483,31 @@ export class PeepsyMaster extends EventEmitter {
     const updatedStats: ProcessStats = {
       requestsHandled: stats.requestsHandled + (updates.requestsHandled ?? 0),
       requestsActive: Math.max(0, stats.requestsActive + (updates.requestsActive ?? 0)),
-      averageResponseTime: updates.averageResponseTime ?? stats.averageResponseTime,
+      averageResponseTime:
+        updates.averageResponseTime !== undefined
+          ? this.applyEma(stats.averageResponseTime, updates.averageResponseTime)
+          : stats.averageResponseTime,
       lastActivity: Date.now(),
       errors: stats.errors + (updates.errors ?? 0),
     };
 
     this.processStats.set(target, updatedStats);
+  }
+
+  private applyEma(previous: number, sample: number, alpha: number = 0.2): number {
+    if (previous === 0) return sample;
+    return alpha * sample + (1 - alpha) * previous;
+  }
+
+  public configureGroup(groupId: string, config: GroupConfig): void {
+    if (!this.groups.has(groupId)) {
+      this.groups.set(groupId, { targets: [], config: { ...config } });
+      this.roundRobinCounters.set(groupId, 0);
+      return;
+    }
+    const group = this.groups.get(groupId)!;
+    group.config = { ...group.config, ...config };
+    this.logger.debug(`Configured group ${groupId}`, { config: group.config });
   }
 
   private getTargetFromChild(child: ChildProcess): string | null {
@@ -477,6 +614,10 @@ export class PeepsyMaster extends EventEmitter {
     }
 
     this.removeAllListeners();
+    if (this.healthMonitor) {
+      clearInterval(this.healthMonitor);
+      this.healthMonitor = undefined;
+    }
   }
 
   // Public getters for monitoring
@@ -486,6 +627,14 @@ export class PeepsyMaster extends EventEmitter {
 
   public getAllProcessStats(): Record<string, ProcessStats> {
     return Object.fromEntries(this.processStats);
+  }
+
+  public getUnhealthyProcesses(): string[] {
+    const result: string[] = [];
+    for (const [target, stats] of this.processStats) {
+      if (stats.status === 'unhealthy') result.push(target);
+    }
+    return result;
   }
 
   public getGroupStats(groupId: string): GroupStats | undefined {
@@ -517,5 +666,42 @@ export class PeepsyMaster extends EventEmitter {
   public isProcessAlive(target: string): boolean {
     const processEntry = this.processes.get(target);
     return processEntry?.child.connected ?? false;
+  }
+
+  private startHealthMonitor(): void {
+    if (this.healthMonitor) return;
+    this.healthMonitor = setInterval(() => {
+      const now = Date.now();
+      for (const [target, stats] of this.processStats) {
+        const last = stats.lastHeartbeatAt ?? stats.lastActivity;
+        if (!last) continue;
+        const missed = now - last > this.heartbeatIntervalMs * this.heartbeatMissThreshold;
+        if (missed) {
+          this.logger.warn(`Child ${target} missed heartbeats; marking unhealthy and restarting`);
+          this.updateProcessStats(target, { status: 'unhealthy' });
+          // attempt restart by killing and letting exit handler respawn
+          const entry = this.processes.get(target);
+          const groupId = entry?.groupId;
+          const groupCfg = groupId ? this.groups.get(groupId)?.config : undefined;
+          const disableAutoRestart = entry?.disableAutoRestart || groupCfg?.disableAutoRestart;
+          try {
+            if (!disableAutoRestart) {
+              entry?.child.kill('SIGKILL');
+              this.emit('heartbeat-missed', { target, timestamp: now });
+            } else {
+              this.logger.warn(`Auto-restart disabled for ${target}; not killing process`);
+              this.emit('heartbeat-missed', { target, timestamp: now });
+            }
+          } catch (err) {
+            this.logger.error(`Failed to kill unhealthy child ${target}`, err);
+          }
+        } else {
+          this.updateProcessStats(target, { status: 'healthy' });
+        }
+      }
+    }, this.heartbeatIntervalMs);
+    if (this.healthMonitor.unref) {
+      this.healthMonitor.unref();
+    }
   }
 }
