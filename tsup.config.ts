@@ -7,7 +7,7 @@ export default defineConfig({
   outDir: 'dist',
   sourcemap: true,
   clean: true,
-  target: 'node16',
+  target: 'node18',
   minify: false,
   treeshake: true,
   skipNodeModulesBundle: true,
