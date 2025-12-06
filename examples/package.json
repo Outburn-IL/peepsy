@@ -1,0 +1,11 @@
+{
+  "name": "peepsy-examples",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "basic": "node basic/master.js",
+    "advanced": "node advanced/task-manager.js",
+    "build-parent": "cd .. && npm run build"
+  },
+  "description": "Examples for Peepsy library usage"
+}
