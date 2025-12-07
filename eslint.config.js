@@ -58,5 +58,23 @@ export default [
       "@typescript-eslint/no-explicit-any": "off"
     }
   },
+  {
+    files: ["__tests__/**/*.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: {
+        ...globals.node
+      }
+    },
+    plugins: {
+      prettier
+    },
+    rules: {
+      "prettier/prettier": "error",
+      "no-empty": ["error", { allowEmptyCatch: false }],
+      "no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }]
+    }
+  },
   configPrettier
 ];
