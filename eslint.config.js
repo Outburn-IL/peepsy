@@ -76,5 +76,23 @@ export default [
       "no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }]
     }
   },
+  {
+    files: ["*.cjs"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "commonjs",
+      globals: {
+        ...globals.node
+      }
+    },
+    plugins: {
+      prettier
+    },
+    rules: {
+      "prettier/prettier": "error",
+      "no-empty": ["error", { allowEmptyCatch: false }],
+      "no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }]
+    }
+  },
   configPrettier
 ];
