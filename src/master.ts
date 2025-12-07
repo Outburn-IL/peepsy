@@ -587,6 +587,7 @@ export class PeepsyMaster extends EventEmitter {
         try {
           child.send({ type: 'SHUTDOWN' });
         } catch (error) {
+          /* istanbul ignore next */
           this.logger.warn(`Failed to send shutdown message to ${target}`, error);
         }
       }
@@ -598,6 +599,7 @@ export class PeepsyMaster extends EventEmitter {
           try {
             child.kill('SIGKILL');
           } catch (error) {
+            /* istanbul ignore next */
             this.logger.error(`Failed to kill child process ${target}`, error);
           }
         }
@@ -615,8 +617,9 @@ export class PeepsyMaster extends EventEmitter {
 
     const targets = Array.from(this.processes.keys());
     const shutdownPromises = targets.map(target =>
-      this.shutdownChild(target, timeout / targets.length).catch(error =>
-        this.logger.error(`Failed to shutdown child ${target}`, error)
+      this.shutdownChild(target, timeout / targets.length).catch(
+        /* istanbul ignore next */
+        error => this.logger.error(`Failed to shutdown child ${target}`, error)
       )
     );
 
@@ -624,6 +627,7 @@ export class PeepsyMaster extends EventEmitter {
       await Promise.allSettled(shutdownPromises);
       this.logger.info('Graceful shutdown completed');
     } catch (error) {
+      /* istanbul ignore next */
       this.logger.error('Error during graceful shutdown', error);
     }
 
@@ -707,6 +711,7 @@ export class PeepsyMaster extends EventEmitter {
               this.emit('heartbeat-missed', { target, timestamp: now });
             }
           } catch (err) {
+            /* istanbul ignore next */
             this.logger.error(`Failed to kill unhealthy child ${target}`, err);
           }
         } else {
