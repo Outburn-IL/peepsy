@@ -35,13 +35,13 @@ describe('PeepsyMaster', () => {
       expect(() => {
         master.spawnChild('test-worker', workerPath, 'sequential');
       }).not.toThrow();
-      
+
       expect(master.isProcessAlive('test-worker')).toBe(true);
     });
 
     it('should throw error when spawning duplicate target', () => {
       master.spawnChild('test-worker', workerPath, 'sequential');
-      
+
       expect(() => {
         master.spawnChild('test-worker', workerPath, 'sequential');
       }).toThrow(PeepsyError);
@@ -49,9 +49,9 @@ describe('PeepsyMaster', () => {
 
     it('should shutdown a child process', async () => {
       master.spawnChild('test-worker', workerPath, 'sequential');
-      
+
       await master.shutdownChild('test-worker');
-      
+
       expect(master.isProcessAlive('test-worker')).toBe(false);
     });
 
@@ -69,14 +69,14 @@ describe('PeepsyMaster', () => {
 
     it('should send request and receive response', async () => {
       const response = await master.sendRequest('echo', 'test-worker', { message: 'hello' });
-      
+
       expect(response.status).toBe(200);
       expect(response.data).toEqual({ echoed: { message: 'hello' } });
     });
 
     it('should handle arithmetic operations', async () => {
       const response = await master.sendRequest('add', 'test-worker', { a: 5, b: 3 });
-      
+
       expect(response.status).toBe(200);
       expect(response.data).toEqual({ result: 8 });
     });
@@ -85,7 +85,7 @@ describe('PeepsyMaster', () => {
       const start = Date.now();
       const response = await master.sendRequest('delay', 'test-worker', { ms: 100 });
       const duration = Date.now() - start;
-      
+
       expect(response.status).toBe(200);
       expect(response.data).toEqual({ delayed: 100 });
       expect(duration).toBeGreaterThanOrEqual(100);
@@ -95,7 +95,7 @@ describe('PeepsyMaster', () => {
       await expect(
         master.sendRequest('error', 'test-worker', { message: 'from child' })
       ).rejects.toThrow(PeepsyError);
-      
+
       // Verify error message
       try {
         await master.sendRequest('error', 'test-worker', { message: 'from child' });
@@ -141,12 +141,22 @@ describe('PeepsyMaster', () => {
 
     it('should get group statistics', async () => {
       await master.sendRequest('echo', 'test-group', { message: 'test' });
-      
+
       const stats = master.getGroupStats('test-group');
-      
+
       expect(stats).toBeDefined();
       expect(stats!.strategy).toBe('round-robin');
       expect(Object.keys(stats!.processes)).toHaveLength(3);
+    });
+
+    it('supports random and least-busy strategies', async () => {
+      master.configureGroup('test-group', { strategy: 'random' } as any);
+      const r1 = await master.sendRequest('echo', 'test-group', { id: 'r1' });
+      expect(r1.status).toBe(200);
+
+      master.configureGroup('test-group', { strategy: 'least-busy' } as any);
+      const r2 = await master.sendRequest('echo', 'test-group', { id: 'r2' });
+      expect(r2.status).toBe(200);
     });
   });
 
@@ -163,7 +173,7 @@ describe('PeepsyMaster', () => {
       });
 
       const response = await master.sendRequest('requestMaster', 'test-worker');
-      
+
       expect(response.status).toBe(200);
       expect(response.data).toHaveProperty('masterResponse');
     });
@@ -184,9 +194,9 @@ describe('PeepsyMaster', () => {
 
     it('should track process statistics', async () => {
       await master.sendRequest('echo', 'test-worker', { message: 'test' });
-      
+
       const stats = master.getProcessStats('test-worker');
-      
+
       expect(stats).toBeDefined();
       expect(stats!.requestsHandled).toBe(1);
       expect(stats!.errors).toBe(0);
@@ -194,9 +204,9 @@ describe('PeepsyMaster', () => {
 
     it('should track all process statistics', async () => {
       await master.sendRequest('echo', 'test-worker', { message: 'test' });
-      
+
       const allStats = master.getAllProcessStats();
-      
+
       expect(allStats).toHaveProperty('test-worker');
       expect(allStats['test-worker']?.requestsHandled).toBe(1);
     });
@@ -206,12 +216,12 @@ describe('PeepsyMaster', () => {
       expect(initialCount).toBe(0);
 
       const promise = master.sendRequest('delay', 'test-worker', { ms: 100 });
-      
+
       // During the request, count should be 1
       expect(master.getActiveRequestsCount()).toBe(1);
-      
+
       await promise;
-      
+
       // After completion, count should be 0
       expect(master.getActiveRequestsCount()).toBe(0);
     });
@@ -225,16 +235,18 @@ describe('PeepsyMaster', () => {
     });
 
     it('should retry failed requests', async () => {
-      const masterWithRetries = new PeepsyMaster({ 
-        timeout: 5000, 
+      const masterWithRetries = new PeepsyMaster({
+        timeout: 5000,
         maxRetries: 2,
-        retryDelay: 100 
+        retryDelay: 100,
       });
-      
+
       masterWithRetries.spawnChild('test-worker', workerPath, 'sequential');
 
       // First request should work
-      const response = await masterWithRetries.sendRequest('echo', 'test-worker', { message: 'test' });
+      const response = await masterWithRetries.sendRequest('echo', 'test-worker', {
+        message: 'test',
+      });
       expect(response.status).toBe(200);
 
       await masterWithRetries.gracefulShutdown();

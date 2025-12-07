@@ -20,18 +20,18 @@ describe('PeepsyChild', () => {
 
   beforeEach(() => {
     // Mock process methods
-    global.process = { 
-      ...originalProcess, 
+    global.process = {
+      ...originalProcess,
       send: mockProcess.send,
       on: mockProcess.on,
       removeAllListeners: mockProcess.removeAllListeners,
-      exit: mockProcess.exit
+      exit: mockProcess.exit,
     } as any;
     mockProcess.send.mockClear();
     mockProcess.on.mockClear();
     mockProcess.removeAllListeners.mockClear();
     mockProcess.exit.mockClear();
-    
+
     child = new PeepsyChild('sequential');
   });
 
@@ -68,7 +68,7 @@ describe('PeepsyChild', () => {
     it('should register handlers', () => {
       const handler = jest.fn();
       child.registerHandler('test', handler);
-      
+
       expect(child.getHandlerActions()).toContain('test');
       expect(child.getHandlerCount()).toBe(1);
     });
@@ -76,7 +76,7 @@ describe('PeepsyChild', () => {
     it('should unregister handlers', () => {
       const handler = jest.fn();
       child.registerHandler('test', handler);
-      
+
       expect(child.unregisterHandler('test')).toBe(true);
       expect(child.unregisterHandler('test')).toBe(false);
       expect(child.getHandlerCount()).toBe(0);
@@ -85,7 +85,7 @@ describe('PeepsyChild', () => {
     it('should track multiple handlers', () => {
       child.registerHandler('action1', () => 'result1');
       child.registerHandler('action2', () => 'result2');
-      
+
       expect(child.getHandlerCount()).toBe(2);
       expect(child.getHandlerActions()).toEqual(['action1', 'action2']);
     });
@@ -93,7 +93,7 @@ describe('PeepsyChild', () => {
 
   describe('Request Processing', () => {
     beforeEach(() => {
-      child.registerHandler('echo', (data) => ({ echoed: data }));
+      child.registerHandler('echo', data => ({ echoed: data }));
       child.registerHandler('add', (data: any) => ({ result: data.a + data.b }));
       child.registerHandler('asyncTask', async (data: any) => {
         await new Promise(resolve => setTimeout(resolve, 10));
@@ -106,54 +106,54 @@ describe('PeepsyChild', () => {
 
     it('should process sync handlers', async () => {
       const request = { id: '1', action: 'echo', data: { message: 'hello' } };
-      
+
       // Simulate message processing
       await (child as any).processRequest(request);
-      
+
       expect(mockProcess.send).toHaveBeenCalledWith({
         type: 'RESPONSE',
         id: '1',
         status: 200,
-        data: { echoed: { message: 'hello' } }
+        data: { echoed: { message: 'hello' } },
       });
     });
 
     it('should process async handlers', async () => {
       const request = { id: '2', action: 'asyncTask', data: { task: 'test-task' } };
-      
+
       await (child as any).processRequest(request);
-      
+
       expect(mockProcess.send).toHaveBeenCalledWith({
         type: 'RESPONSE',
         id: '2',
         status: 200,
-        data: { completed: 'test-task' }
+        data: { completed: 'test-task' },
       });
     });
 
     it('should handle errors in handlers', async () => {
       const request = { id: '3', action: 'errorTask', data: {} };
-      
+
       await (child as any).processRequest(request);
-      
+
       expect(mockProcess.send).toHaveBeenCalledWith({
         type: 'RESPONSE',
         id: '3',
         status: 500,
-        error: 'Handler error'
+        error: 'Handler error',
       });
     });
 
     it('should handle unknown actions', async () => {
       const request = { id: '4', action: 'unknown', data: {} };
-      
+
       await (child as any).processRequest(request);
-      
+
       expect(mockProcess.send).toHaveBeenCalledWith({
         type: 'RESPONSE',
         id: '4',
         status: 404,
-        error: 'No handler registered for action: unknown'
+        error: 'No handler registered for action: unknown',
       });
     });
   });
@@ -183,49 +183,49 @@ describe('PeepsyChild', () => {
     it('should send request to master', async () => {
       // Mock successful response
       const responsePromise = child.sendRequest('test-action', { data: 'test' });
-      
+
       // Simulate master response
-      const mockResponse = { 
-        type: 'RESPONSE', 
-        id: expect.any(String), 
-        status: 200, 
-        data: { result: 'success' } 
+      const mockResponse = {
+        type: 'RESPONSE',
+        id: expect.any(String),
+        status: 200,
+        data: { result: 'success' },
       };
-      
+
       // Get the request ID from the sent message
       const sentMessage = mockProcess.send.mock.calls[0][0];
       const responseMessage = { ...mockResponse, id: sentMessage.id };
-      
+
       // Simulate receiving response
       setTimeout(() => {
         (child as any).activeRequests.get(sentMessage.id)?.(responseMessage);
       }, 10);
-      
+
       const result = await responsePromise;
       expect(result).toEqual({ result: 'success' });
     });
 
     it('should handle request errors', async () => {
       const responsePromise = child.sendRequest('test-action', { data: 'test' });
-      
+
       const sentMessage = mockProcess.send.mock.calls[0][0];
-      const errorResponse = { 
-        type: 'RESPONSE', 
+      const errorResponse = {
+        type: 'RESPONSE',
         id: sentMessage.id,
         status: 500,
-        error: 'Test error' 
+        error: 'Test error',
       };
-      
+
       setTimeout(() => {
         (child as any).activeRequests.get(sentMessage.id)?.(errorResponse);
       }, 10);
-      
+
       await expect(responsePromise).rejects.toThrow('Test error');
     });
 
     it('should timeout requests', async () => {
       const responsePromise = child.sendRequest('test-action', { data: 'test' }, { timeout: 100 });
-      
+
       await expect(responsePromise).rejects.toThrow('Request timed out');
     });
   });
@@ -250,13 +250,13 @@ describe('PeepsyChild', () => {
       // Enqueue multiple requests quickly
       const request1 = { id: '1', action: 'test', data: { order: 1 } };
       const request2 = { id: '2', action: 'test', data: { order: 2 } };
-      
+
       (sequentialChild as any).enqueueRequest(request1, 5000);
       (sequentialChild as any).enqueueRequest(request2, 5000);
-      
+
       // Wait for processing to complete
       await new Promise(resolve => setTimeout(resolve, 100));
-      
+
       expect(handler).toHaveBeenCalledTimes(2);
       expect(sequentialChild.getQueueSize()).toBe(0);
       // Verify sequential processing order
@@ -268,7 +268,7 @@ describe('PeepsyChild', () => {
     it('should handle process errors gracefully', () => {
       const errorHandler = jest.fn();
       child.registerHandler('test', errorHandler);
-      
+
       // Should not throw when processing invalid messages
       expect(() => {
         (child as any).setupMessageHandlers();
@@ -277,7 +277,7 @@ describe('PeepsyChild', () => {
 
     it('should handle shutdown during active requests', () => {
       child.registerHandler('longTask', () => new Promise(resolve => setTimeout(resolve, 1000)));
-      
+
       expect(() => {
         (child as any).gracefulShutdown();
       }).not.toThrow();
