@@ -437,6 +437,7 @@ export class PeepsyChild {
       // Hint exit code without forcing termination
       process.exitCode = 0;
     } catch (err) {
+      /* istanbul ignore next */
       void err;
     }
   }
