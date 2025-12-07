@@ -1,0 +1,80 @@
+{
+  "name": "peepsy",
+  "version": "1.0.0",
+  "description": "A Node.js library for bidirectional, HTTP-like inter-process communication using promises",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist/**/*"
+  ],
+  "scripts": {
+    "build": "npm run clean && npm run generate-version && tsup",
+    "prebuild": "npm run format:check && npm run lint",
+    "generate-version": "node scripts/generate-version.js",
+    "build:watch": "tsup --watch",
+    "clean": "rimraf dist",
+    "test": "jest --runInBand",
+    "pretest": "npm run format:check && npm run lint",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --runInBand --coverage",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "prepublishOnly": "npm run format:check && npm run lint && npm run test && npm run build",
+    "ci": "npm run format:check && npm run lint && npm test -s && npm run build",
+    "release": "standard-version",
+    "dev": "ts-node src/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Outburn-IL/peepsy.git"
+  },
+  "keywords": [
+    "ipc",
+    "inter-process-communication",
+    "child-process",
+    "promises",
+    "nodejs",
+    "worker",
+    "communication",
+    "concurrent",
+    "sequential",
+    "load-balancing"
+  ],
+  "author": "Outburn Ltd.",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Outburn-IL/peepsy/issues"
+  },
+  "homepage": "https://github.com/Outburn-IL/peepsy#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.19.1",
+    "@typescript-eslint/eslint-plugin": "^8.48.1",
+    "@typescript-eslint/parser": "^8.48.1",
+    "eslint": "^9.39.1",
+    "eslint-config-prettier": "^9.1.2",
+    "eslint-plugin-prettier": "^5.5.4",
+    "jest": "^29.7.0",
+    "prettier": "^3.7.4",
+    "rimraf": "^6.1.2",
+    "standard-version": "^9.5.0",
+    "ts-jest": "^29.4.6",
+    "ts-node": "^10.9.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  }
+}
