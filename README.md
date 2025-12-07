@@ -1,6 +1,6 @@
 # Peepsy
 
-[![npm version](https://badge.fury.io/js/peepsy.svg)](https://badge.fury.io/js/peepsy)
+[![npm version](https://img.shields.io/npm/v/peepsy.svg)](https://www.npmjs.com/package/peepsy)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Peepsy** (pronounced *peep-see*) is a powerful Node.js library for **bidirectional, HTTP-like inter-process communication** using promises. The name is a phonetic spelling of **PIPC** (*Promisified Inter Process Communication*).
