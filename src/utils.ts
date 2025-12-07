@@ -77,11 +77,9 @@ export class DefaultLogger implements PeepsyLogger {
     const timestamp = new Date().toISOString();
     const argsStr =
       args.length > 0
-        ? ` ${args
-            .map(arg => (typeof arg === 'object' ? JSON.stringify(arg) : String(arg)))
-            .join(' ')}`
+        ? args.map(arg => (typeof arg === 'object' ? JSON.stringify(arg) : String(arg))).join(' ')
         : '';
-    return `[${timestamp}] [${level.toUpperCase()}] [Peepsy] ${message}${argsStr}`;
+    return `[${timestamp}] [${level.toUpperCase()}] [Peepsy] ${message}${argsStr ? ` ${argsStr}` : ''}`;
   }
 
   public debug(message: string, ...args: unknown[]): void {

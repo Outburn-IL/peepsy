@@ -308,10 +308,11 @@ export class PeepsyMaster extends EventEmitter {
     child.on('exit', (code: number | null, signal: string | null) => {
       this.logger.info(`Child process exited: ${target}`, { code, signal, pid: child.pid });
       const prev = this.processes.get(target);
+      // Capture group config before cleanup (cleanup removes group entry)
+      const groupId = prev?.groupId;
+      const groupCfg = groupId ? this.groups.get(groupId)?.config : undefined;
       this.cleanupProcess(target);
       if (!this.isShuttingDown && prev?.scriptPath) {
-        const groupId = prev.groupId;
-        const groupCfg = groupId ? this.groups.get(groupId)?.config : undefined;
         const disableAutoRestart = prev.disableAutoRestart || groupCfg?.disableAutoRestart;
         try {
           if (!disableAutoRestart) {
@@ -487,9 +488,22 @@ export class PeepsyMaster extends EventEmitter {
         updates.averageResponseTime !== undefined
           ? this.applyEma(stats.averageResponseTime, updates.averageResponseTime)
           : stats.averageResponseTime,
-      lastActivity: Date.now(),
+      lastActivity: updates.lastActivity !== undefined ? updates.lastActivity : stats.lastActivity,
       errors: stats.errors + (updates.errors ?? 0),
     };
+
+    // Preserve optional fields when not provided in updates
+    if ((updates as any).status !== undefined) {
+      (updatedStats as any).status = (updates as any).status;
+    } else if ((stats as any).status !== undefined) {
+      (updatedStats as any).status = (stats as any).status;
+    }
+
+    if ((updates as any).lastHeartbeatAt !== undefined) {
+      (updatedStats as any).lastHeartbeatAt = (updates as any).lastHeartbeatAt;
+    } else if ((stats as any).lastHeartbeatAt !== undefined) {
+      (updatedStats as any).lastHeartbeatAt = (stats as any).lastHeartbeatAt;
+    }
 
     this.processStats.set(target, updatedStats);
   }

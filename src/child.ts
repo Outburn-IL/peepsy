@@ -45,7 +45,12 @@ export class PeepsyChild {
       throw new PeepsyError('Invalid timeout value. Must be a positive integer <= 300000ms');
     }
 
-    if (mode === 'sequential') {
+    if (
+      mode === 'sequential' ||
+      (mode === 'concurrent' &&
+        typeof options.maxConcurrency === 'number' &&
+        options.maxConcurrency > 0)
+    ) {
       this.queue = new PriorityQueue();
       this.startQueueCleanup();
     }
