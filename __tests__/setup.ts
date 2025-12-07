@@ -29,6 +29,20 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
+// Cleanup after each test
+afterEach(async () => {
+  // Clear any remaining timers
+  jest.clearAllTimers();
+
+  // Force garbage collection if available
+  if (global.gc) {
+    global.gc();
+  }
+
+  // Small delay for cleanup
+  await new Promise(resolve => setTimeout(resolve, 50));
+});
+
 // Cleanup after all tests
 afterAll(async () => {
   // Clean up any remaining timers
@@ -39,6 +53,6 @@ afterAll(async () => {
     global.gc();
   }
 
-  // Small delay to allow async cleanup to complete
+  // Allow time for handles to close
   await new Promise(resolve => setTimeout(resolve, 100));
 });

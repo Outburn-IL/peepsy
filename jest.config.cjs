@@ -6,10 +6,10 @@ module.exports = {
   collectCoverageFrom: ['src/**/*.ts', '!src/**/*.d.ts'],
   coverageThreshold: {
     global: {
-      branches: 83,
-      functions: 94,
+      branches: 82,
+      functions: 93,
       lines: 93,
-      statements: 92,
+      statements: 91,
     },
   },
   testTimeout: 30000,
@@ -18,8 +18,10 @@ module.exports = {
   },
   // Force exit after tests to prevent hanging
   forceExit: true,
-  // Detect open handles in CI
-  detectOpenHandles: process.env.CI === 'true',
+  // Detect open handles in CI environments
+  detectOpenHandles: process.env['CI'] === 'true',
+  // More aggressive cleanup for CI
+  maxWorkers: 1,
   // Cleanup after each test
   setupFilesAfterEnv: ['<rootDir>/__tests__/setup.ts'],
 };

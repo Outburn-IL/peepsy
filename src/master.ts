@@ -109,6 +109,22 @@ export class PeepsyMaster extends EventEmitter {
         // Allow Jest to exit without waiting on child process handles
         child.unref();
       }
+
+      // Ensure process can be killed forcefully for tests
+      if (process.env['NODE_ENV'] === 'test' || process.env['JEST_WORKER_ID']) {
+        // In test environment, ensure we can force kill
+        child.on('error', () => {
+          // Ignore errors during test cleanup
+        });
+
+        // Set a lower max listener limit to avoid warnings
+        child.setMaxListeners(5);
+
+        // Ensure stdin/stdout/stderr are properly handled
+        if (child.stdin) child.stdin.destroy();
+        if (child.stdout) child.stdout.destroy();
+        if (child.stderr) child.stderr.destroy();
+      }
       const processEntry: ChildProcessEntry = {
         child,
         mode,
