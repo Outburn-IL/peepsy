@@ -395,4 +395,60 @@ describe('PeepsyChild Coverage Tests', () => {
       expect(logger.debug).toHaveBeenCalledWith('PeepsyChild initialized in sequential mode');
     });
   });
+
+  describe('Forced Shutdown Warning Coverage', () => {
+    it('should warn when forced shutdown occurs with requests in progress', async () => {
+      const logger = {
+        debug: jest.fn(),
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+      };
+
+      const child = new PeepsyChild('concurrent', { logger });
+
+      // Simulate requests in progress by setting the internal counter
+      (child as any).requestsInProgress = 2;
+
+      // Mock Date.now to simulate timeout condition
+      const originalDateNow = Date.now;
+      let callCount = 0;
+      Date.now = jest.fn(() => {
+        callCount++;
+        // First call: start time (0)
+        // Second call: check time (11000) - simulates timeout exceeded
+        return callCount === 1 ? 0 : 11000;
+      });
+
+      try {
+        await (child as any).gracefulShutdown();
+
+        // Verify the forced shutdown warning was logged
+        expect(logger.warn).toHaveBeenCalledWith(
+          'Forced shutdown with 2 requests still in progress'
+        );
+      } finally {
+        Date.now = originalDateNow;
+      }
+    }, 10000);
+
+    it('should not warn when graceful shutdown completes without pending requests', async () => {
+      const logger = {
+        debug: jest.fn(),
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+      };
+
+      const child = new PeepsyChild('concurrent', { logger });
+
+      // No requests in progress (requestsInProgress = 0)
+      await (child as any).gracefulShutdown();
+
+      // Verify no forced shutdown warning was logged
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining('Forced shutdown with')
+      );
+    }, 5000);
+  });
 });
