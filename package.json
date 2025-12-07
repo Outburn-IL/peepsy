@@ -25,7 +25,7 @@
     "test": "jest --runInBand",
     "pretest": "npm run format:check && npm run lint",
     "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage",
+    "test:coverage": "jest --runInBand --coverage",
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "format": "prettier --write \"src/**/*.ts\"",
