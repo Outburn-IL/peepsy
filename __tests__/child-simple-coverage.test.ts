@@ -446,9 +446,7 @@ describe('PeepsyChild Coverage Tests', () => {
       await (child as any).gracefulShutdown();
 
       // Verify no forced shutdown warning was logged
-      expect(logger.warn).not.toHaveBeenCalledWith(
-        expect.stringContaining('Forced shutdown with')
-      );
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('Forced shutdown with'));
     }, 5000);
   });
 });
