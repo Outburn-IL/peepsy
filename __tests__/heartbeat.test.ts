@@ -1,5 +1,5 @@
 import { join } from 'path';
-import { PeepsyMaster } from '../src/index';
+import { ChildProcessEntry, PeepsyMaster } from '../src/index';
 
 jest.setTimeout(15000);
 
@@ -61,8 +61,8 @@ describe('Heartbeat and auto-restart', () => {
       });
     });
 
-    // Kill process to trigger exit and auto-restart
-    await master.shutdownChild('w2');
+    const entry = (Reflect.get(master, 'processes') as Map<string, ChildProcessEntry>).get('w2')!;
+    entry.child.kill('SIGKILL');
 
     await restarted;
     await master.gracefulShutdown();

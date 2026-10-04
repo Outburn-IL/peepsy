@@ -8,6 +8,7 @@ import { PeepsyChild } from '../src/index';
 const mockProcess = {
   send: jest.fn(),
   on: jest.fn(),
+  removeListener: jest.fn(),
   removeAllListeners: jest.fn(),
   exit: jest.fn(),
   disconnect: jest.fn(),
@@ -24,6 +25,7 @@ describe('PeepsyChild Coverage Tests', () => {
       ...originalProcess,
       send: mockProcess.send,
       on: mockProcess.on,
+      removeListener: mockProcess.removeListener,
       removeAllListeners: mockProcess.removeAllListeners,
       exit: mockProcess.exit,
       disconnect: mockProcess.disconnect,
@@ -100,20 +102,19 @@ describe('PeepsyChild Coverage Tests', () => {
       expect(() => messageHandler(requestMessage)).not.toThrow();
     });
 
-    it('should handle RESPONSE message with active request', () => {
+    it('should handle RESPONSE message with active request', async () => {
+      const pending = child.sendRequest('test', {});
+      const request = mockProcess.send.mock.calls[mockProcess.send.mock.calls.length - 1]![0];
       const responseMessage = {
         type: 'RESPONSE',
-        id: 'response-1',
+        id: request.id,
+        status: 200,
         data: { result: 'success' },
       };
 
-      // Add an active request to respond to
-      const mockResolve = jest.fn();
-      (child as any).activeRequests.set('response-1', mockResolve);
-
       messageHandler(responseMessage);
-      expect(mockResolve).toHaveBeenCalledWith(responseMessage);
-      expect((child as any).activeRequests.has('response-1')).toBe(false);
+      await expect(pending).resolves.toEqual(responseMessage.data);
+      expect(child.getActiveRequestsCount()).toBe(0);
     });
 
     it('should handle SHUTDOWN message', () => {
@@ -202,7 +203,7 @@ describe('PeepsyChild Coverage Tests', () => {
         pid: 12345,
         timestamp: expect.any(Number),
         requestsActive: 0,
-      });
+      }, undefined, undefined, expect.any(Function));
     });
 
     it('should handle heartbeat send errors gracefully', () => {

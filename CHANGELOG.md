@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Spawn controls for `execArgv`, fork-compatible `stdio`, `inheritEnv` and per-target `disableAutoRestart`.
+- Optional signal ownership via `handleSignals` on master and child.
+- Frozen transport-derived master handler context and per-spawn generation identities on spawn/exit events.
+- Confirmed `terminateChild` cleanup, bounded termination failures and child pending-request counts.
+
+### Fixed
+- Settle pending requests and clear timers exactly once on timeout, failed send, disconnect, exit and shutdown.
+- Release group capacity after failed requests; reject queues when no worker remains.
+- Suppress restart after intentional stops, accelerate graceful stops on explicit termination, and fence stale child events/results.
+- Confirm failed-fork cleanup even when Node emits close without exit; detach owned lifecycle listeners.
+- Catch synchronous master handler throws and avoid late sends on closed IPC channels.
+- Keep raw callback errors, request payloads and spawn environment/options out of internal lifecycle logs.
+
 ## [1.0.0] - 2025-12-06
 
 ### Added

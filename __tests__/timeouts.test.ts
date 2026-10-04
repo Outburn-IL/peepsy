@@ -23,6 +23,8 @@ describe('Timeouts and retries', () => {
       master.sendRequest('delay', groupId, { ms: 200 } as any, { timeout: 50, retries: 1 })
     ).rejects.toMatchObject({ name: 'PeepsyTimeoutError', code: 'PEEPSY_TIMEOUT' });
 
+    expect(master.getActiveRequestsCount()).toBe(0);
+    expect(master.getProcessStats('t1')?.requestsActive).toBe(0);
     await master.gracefulShutdown();
   });
 

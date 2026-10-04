@@ -2,7 +2,7 @@
  * PeepsyMaster - Master process for managing child processes and communication
  */
 
-import { ChildProcess, fork } from 'child_process';
+import { ChildProcess, fork, ForkOptions } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import {
@@ -22,15 +22,30 @@ import {
   PeepsyTimeoutError,
   PeepsyProcessError,
   PeepsyNotFoundError,
+  PeepsyRequestContext,
 } from './types';
 import { DefaultLogger, delay, isValidTimeout, sanitizeError } from './utils';
 
+interface PendingRequest {
+  target: string;
+  entry: ChildProcessEntry;
+  timer: ReturnType<typeof setTimeout>;
+  startedAt: number;
+  resolve: (response: ResponseMessage) => void;
+  reject: (error: Error) => void;
+}
+
 export class PeepsyMaster extends EventEmitter {
-  private static processListenersRegistered: boolean = false;
+  private static readonly signalMasters = new Set<PeepsyMaster>();
+  private static readonly signalHandler = (): void => {
+    for (const master of PeepsyMaster.signalMasters) {
+      void master.gracefulShutdown().catch(() => master.logger.error('Signal shutdown failed'));
+    }
+  };
   private readonly processes: Map<string, ChildProcessEntry> = new Map();
   private readonly groups: Map<string, { targets: string[]; config: GroupConfig }> = new Map();
   private readonly roundRobinCounters: Map<string, number> = new Map();
-  private readonly activeRequests: Map<string, (response: ResponseMessage) => void> = new Map();
+  private readonly activeRequests: Map<string, PendingRequest> = new Map();
   private readonly groupQueues: Map<
     string,
     Array<{
@@ -41,7 +56,10 @@ export class PeepsyMaster extends EventEmitter {
       reject: (e: Error) => void;
     }>
   > = new Map();
-  private readonly handlers: Map<string, (data: any) => Promise<any> | any> = new Map();
+  private readonly handlers: Map<
+    string,
+    (data: any, context: PeepsyRequestContext) => Promise<any> | any
+  > = new Map();
   private readonly processStats: Map<string, ProcessStats> = new Map();
   private readonly logger: PeepsyLogger;
   private readonly timeout: number;
@@ -51,6 +69,11 @@ export class PeepsyMaster extends EventEmitter {
   private readonly heartbeatMissThreshold: number;
   private isShuttingDown: boolean = false;
   private healthMonitor: ReturnType<typeof setInterval> | undefined = undefined;
+  private shutdownPromise?: Promise<void>;
+  private readonly stoppingProcesses = new Map<
+    ChildProcessEntry,
+    { promise: Promise<void>; forceKill: () => void }
+  >();
 
   constructor(options: PeepsyOptions = {}) {
     super();
@@ -65,16 +88,12 @@ export class PeepsyMaster extends EventEmitter {
       throw new PeepsyError('Invalid timeout value. Must be a positive integer <= 300000ms');
     }
 
-    // Set up cleanup on process termination (register once across instances)
-    if (!PeepsyMaster.processListenersRegistered) {
-      process.on('SIGINT', () => this.gracefulShutdown());
-      process.on('SIGTERM', () => this.gracefulShutdown());
-      // Avoid beforeExit handler which can keep Jest workers alive
-      // Prevent MaxListeners warnings in test environments creating many masters
-      if (typeof process.setMaxListeners === 'function') {
-        process.setMaxListeners(0);
+    if (options.handleSignals !== false) {
+      if (PeepsyMaster.signalMasters.size === 0) {
+        process.on('SIGINT', PeepsyMaster.signalHandler);
+        process.on('SIGTERM', PeepsyMaster.signalHandler);
       }
-      PeepsyMaster.processListenersRegistered = true;
+      PeepsyMaster.signalMasters.add(this);
     }
 
     // Start health monitor to check heartbeats
@@ -96,13 +115,16 @@ export class PeepsyMaster extends EventEmitter {
       throw new PeepsyError(`Process with target '${target}' already exists`);
     }
 
-    this.logger.debug(`Spawning child process: ${target}`, { scriptPath, mode, groupId, options });
+    this.logger.debug(`Spawning child process: ${target}`, { mode, groupId });
 
     try {
-      const forkOptions: any = {};
+      const forkOptions: ForkOptions = {};
       if (options.execPath) forkOptions.execPath = options.execPath;
       if (options.silent !== undefined) forkOptions.silent = options.silent;
-      if (options.env) forkOptions.env = { ...process.env, ...options.env };
+      if (options.execArgv !== undefined) forkOptions.execArgv = options.execArgv;
+      if (options.stdio !== undefined) forkOptions.stdio = options.stdio;
+      if (options.inheritEnv === false) forkOptions.env = { ...options.env };
+      else if (options.env) forkOptions.env = { ...process.env, ...options.env };
 
       const child = fork(scriptPath, [], forkOptions);
       if (typeof child.unref === 'function') {
@@ -117,9 +139,6 @@ export class PeepsyMaster extends EventEmitter {
           // Ignore errors during test cleanup
         });
 
-        // Set a lower max listener limit to avoid warnings
-        child.setMaxListeners(5);
-
         // Ensure stdin/stdout/stderr are properly handled
         if (child.stdin) child.stdin.destroy();
         if (child.stdout) child.stdout.destroy();
@@ -127,6 +146,10 @@ export class PeepsyMaster extends EventEmitter {
       }
       const processEntry: ChildProcessEntry = {
         child,
+        processInstanceId: randomUUID(),
+        ...(options.disableAutoRestart !== undefined
+          ? { disableAutoRestart: options.disableAutoRestart }
+          : {}),
         mode,
         scriptPath,
         spawnOptions: options,
@@ -141,22 +164,37 @@ export class PeepsyMaster extends EventEmitter {
       }
 
       this.setupChildEventHandlers(child, target);
-      child.send({ type: 'INIT', mode });
+      try {
+        child.send({ type: 'INIT', mode }, error => {
+          if (error) this.handleTransportFailure(target, processEntry);
+        });
+      } catch {
+        this.handleTransportFailure(target, processEntry);
+        throw new PeepsyProcessError('Failed to initialize IPC', target);
+      }
 
       this.logger.info(`Child process spawned: ${target}`, { pid: child.pid });
-      this.emit('spawn', { type: 'spawn', timestamp: Date.now(), target });
-    } catch (error) {
+      this.emit('spawn', {
+        type: 'spawn',
+        timestamp: Date.now(),
+        target,
+        processInstanceId: processEntry.processInstanceId,
+      });
+    } catch {
       const errorMsg = `Failed to spawn child process: ${target}`;
-      this.logger.error(errorMsg, error);
+      this.logger.error(errorMsg);
       throw new PeepsyProcessError(errorMsg, target);
     }
   }
 
   public registerHandler<TReq = unknown, TRes = unknown>(
     action: string,
-    handler: (data: TReq) => Promise<TRes> | TRes
+    handler: (data: TReq, context: PeepsyRequestContext) => Promise<TRes> | TRes
   ): void {
-    this.handlers.set(action, handler as unknown as (data: any) => Promise<any> | any);
+    this.handlers.set(
+      action,
+      handler as unknown as (data: any, context: PeepsyRequestContext) => Promise<any> | any
+    );
     this.logger.debug(`Handler registered for action: ${action}`);
   }
 
@@ -204,7 +242,7 @@ export class PeepsyMaster extends EventEmitter {
         this.logger.warn(`Request attempt ${attempt + 1} failed`, {
           action,
           targetOrGroup,
-          error: sanitizeError(error),
+          code: error instanceof PeepsyError ? error.code : 'PEEPSY_PROCESS',
         });
       }
     }
@@ -219,6 +257,8 @@ export class PeepsyMaster extends EventEmitter {
     timeout: number
   ): Promise<ResponseMessage> {
     return new Promise((resolve, reject) => {
+      if (this.isShuttingDown)
+        return reject(new PeepsyError('Cannot send request during shutdown'));
       let processEntry: ChildProcessEntry | undefined;
 
       try {
@@ -242,98 +282,174 @@ export class PeepsyMaster extends EventEmitter {
           processEntry = this.processes.get(targetOrGroup);
         }
 
-        if (!processEntry) {
+        if (
+          !processEntry ||
+          processEntry.stopping ||
+          processEntry.disconnected ||
+          !processEntry.child.connected
+        ) {
           return reject(new PeepsyNotFoundError(targetOrGroup));
         }
 
         const { child } = processEntry;
+        const target = this.getTargetFromChild(child)!;
         const id = randomUUID();
         const request: RequestMessage = { id, action, data };
 
         const timeoutHandle = setTimeout(() => {
-          this.activeRequests.delete(id);
-          this.updateProcessStats(this.getTargetFromChild(child), { errors: 1 });
-          reject(new PeepsyTimeoutError(timeout, targetOrGroup));
+          this.settleRequest(id, undefined, new PeepsyTimeoutError(timeout, targetOrGroup));
         }, timeout);
 
-        this.activeRequests.set(id, (response: ResponseMessage) => {
-          clearTimeout(timeoutHandle);
-          this.updateProcessStats(this.getTargetFromChild(child), {
-            requestsHandled: 1,
-            averageResponseTime: Date.now() - startTime,
-          });
-
-          if (response.status >= 400) {
-            this.updateProcessStats(this.getTargetFromChild(child), { errors: 1 });
-            reject(
-              new PeepsyError(response.error ?? `Request failed with status ${response.status}`)
-            );
-          } else {
-            resolve(response);
-          }
+        this.activeRequests.set(id, {
+          target,
+          entry: processEntry,
+          timer: timeoutHandle,
+          startedAt: Date.now(),
+          resolve,
+          reject,
         });
-
-        const startTime = Date.now();
-        this.updateProcessStats(this.getTargetFromChild(child), { requestsActive: 1 });
-
-        child.send({ type: 'REQUEST', request, timeout });
+        this.updateProcessStats(target, { requestsActive: 1 });
+        try {
+          child.send({ type: 'REQUEST', request, timeout }, error => {
+            if (error) this.settleRequest(id, undefined, error);
+          });
+        } catch (error) {
+          this.settleRequest(
+            id,
+            undefined,
+            error instanceof Error ? error : new PeepsyError('IPC send failed')
+          );
+        }
       } catch (error) {
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
 
+  private settleRequest(
+    id: string,
+    response?: ResponseMessage,
+    error?: Error,
+    dispatch = true
+  ): void {
+    const pending = this.activeRequests.get(id);
+    if (!pending) return;
+    this.activeRequests.delete(id);
+    clearTimeout(pending.timer);
+    const failure =
+      error ??
+      (response && response.status >= 400
+        ? new PeepsyError(response.error ?? `Request failed with status ${response.status}`)
+        : undefined);
+    if (this.processes.get(pending.target) === pending.entry) {
+      this.updateProcessStats(pending.target, {
+        requestsActive: -1,
+        ...(response
+          ? { requestsHandled: 1, averageResponseTime: Date.now() - pending.startedAt }
+          : {}),
+        ...(failure ? { errors: 1 } : {}),
+      });
+    }
+    if (failure) pending.reject(failure);
+    else pending.resolve(response!);
+    if (dispatch) this.maybeDispatchQueued(pending.target);
+  }
+
+  private rejectTargetRequests(target: string, entry: ChildProcessEntry): void {
+    for (const [id, pending] of this.activeRequests) {
+      if (pending.entry === entry)
+        this.settleRequest(
+          id,
+          undefined,
+          new PeepsyProcessError('IPC process unavailable', target),
+          false
+        );
+    }
+  }
+
+  private handleTransportFailure(target: string, entry: ChildProcessEntry): void {
+    if (this.processes.get(target) !== entry) return;
+    entry.disconnected = true;
+    this.rejectTargetRequests(target, entry);
+    void this.stopProcess(target, entry, 0, false).catch(() => {
+      this.logger.error(`Child termination was not confirmed: ${target}`);
+    });
+  }
+
   private setupChildEventHandlers(child: ChildProcess, target: string): void {
-    child.on('message', (message: any) => {
+    const entry = this.processes.get(target)!;
+    const onMessage = (message: any): void => {
+      if (
+        this.processes.get(target) !== entry ||
+        entry.stopping ||
+        entry.disconnected ||
+        !child.connected
+      )
+        return;
       try {
         if (message?.type === 'REQUEST') {
           this.handleChildRequest(message as RequestEnvelope, child);
         } else if (message?.type === 'RESPONSE' && this.activeRequests.has(message.id)) {
-          const resolve = this.activeRequests.get(message.id);
-          if (resolve) {
+          const pending = this.activeRequests.get(message.id);
+          if (pending?.entry.child === child) {
             const env = message as ResponseEnvelope;
             const errStr = env.error ?? env.errorPayload?.message;
             const mapped: ResponseMessage = errStr
               ? { id: env.id, status: env.status, data: env.data, error: errStr }
               : { id: env.id, status: env.status, data: env.data };
-            resolve(mapped);
-            this.activeRequests.delete(message.id);
-            this.updateProcessStats(target, { requestsActive: -1 });
-            this.maybeDispatchQueued(target);
+            this.settleRequest(message.id, mapped);
           }
         } else if (message?.type === 'HEARTBEAT') {
           const ts = message.timestamp ?? Date.now();
           this.updateProcessStats(target, { lastHeartbeatAt: ts, lastActivity: ts });
         }
-      } catch (error) {
-        this.logger.error(`Error handling message from child ${target}`, error);
+      } catch {
+        this.logger.error(`Error handling message from child ${target}`);
       }
-    });
+    };
 
-    child.on('error', (error: Error) => {
-      this.logger.error(`Child process error: ${target}`, error);
+    const onError = (error: Error): void => {
+      if (this.processes.get(target) !== entry) return;
+      this.logger.error(`Child process error: ${target}`);
       this.updateProcessStats(target, { errors: 1 });
-      this.emit('error', {
-        type: 'error',
-        timestamp: Date.now(),
-        target,
-        error,
-      });
-    });
+      this.handleTransportFailure(target, entry);
+      if (this.listenerCount('error') > 0)
+        this.emit('error', {
+          type: 'error',
+          timestamp: Date.now(),
+          target,
+          error,
+        });
+    };
 
-    child.on('exit', (code: number | null, signal: string | null) => {
+    const onExit = (code: number | null, signal: ChildProcess['signalCode']): void => {
+      if (this.processes.get(target) !== entry) return;
+      child.removeListener('message', onMessage);
+      child.removeListener('error', onError);
+      child.removeListener('exit', onExit);
+      child.removeListener('close', onExit);
+      child.removeListener('disconnect', onDisconnect);
       this.logger.info(`Child process exited: ${target}`, { code, signal, pid: child.pid });
-      const prev = this.processes.get(target);
+      const prev = entry;
       // Capture group config before cleanup (cleanup removes group entry)
       const groupId = prev?.groupId;
       const groupCfg = groupId ? this.groups.get(groupId)?.config : undefined;
+      this.rejectTargetRequests(target, entry);
       this.cleanupProcess(target);
-      if (!this.isShuttingDown && prev?.scriptPath) {
+      this.emit('exit', {
+        target,
+        processInstanceId: entry.processInstanceId,
+        code,
+        signal,
+        intentional: !!entry.stopping,
+      });
+      if (!this.isShuttingDown && !entry.stopping && prev.scriptPath) {
         const disableAutoRestart = prev.disableAutoRestart || groupCfg?.disableAutoRestart;
         try {
           if (!disableAutoRestart) {
             this.logger.warn(`Auto-restarting child ${target}`);
             this.emit('auto-restart', { target, code, signal });
+            if (groupId && groupCfg) this.configureGroup(groupId, groupCfg);
             this.spawnChild(
               target,
               prev.scriptPath,
@@ -344,19 +460,31 @@ export class PeepsyMaster extends EventEmitter {
           } else {
             this.logger.warn(`Auto-restart disabled for ${target}`);
           }
-        } catch (err) {
-          this.logger.error(`Failed to auto-restart child ${target}`, err);
+        } catch {
+          this.logger.error(`Failed to auto-restart child ${target}`);
         }
       }
-    });
+      if (groupId) {
+        const member = this.groups.get(groupId)?.targets[0];
+        if (member) this.maybeDispatchQueued(member);
+        else this.rejectGroupQueue(groupId);
+      }
+    };
 
-    child.on('disconnect', () => {
+    const onDisconnect = (): void => {
       this.logger.debug(`Child process disconnected: ${target}`);
-    });
+      this.handleTransportFailure(target, entry);
+    };
+    child.on('message', onMessage);
+    child.on('error', onError);
+    child.on('exit', onExit);
+    child.on('close', onExit);
+    child.on('disconnect', onDisconnect);
   }
 
   // Attempt to dispatch the next queued request for any group containing the freed target
   private maybeDispatchQueued(targetFreed: string): void {
+    if (this.isShuttingDown) return;
     for (const [groupId, group] of this.groups) {
       if (!group.targets.includes(targetFreed)) continue;
       const queue = this.groupQueues.get(groupId);
@@ -377,16 +505,58 @@ export class PeepsyMaster extends EventEmitter {
     }
   }
 
+  private rejectGroupQueue(groupId: string): void {
+    const queue = this.groupQueues.get(groupId);
+    this.groupQueues.delete(groupId);
+    for (const pending of queue ?? [])
+      pending.reject(new PeepsyProcessError('Group unavailable', groupId));
+  }
+
   private handleChildRequest(message: RequestEnvelope, child: ChildProcess): void {
     const { id, action, data } = message;
     const target = this.getTargetFromChild(child);
+    if (!target) return;
+    const entry = this.processes.get(target)!;
+    if (entry.stopping || entry.disconnected || !child.connected || this.isShuttingDown) return;
+    const send = (envelope: ResponseEnvelope): void => {
+      if (
+        this.processes.get(target) !== entry ||
+        entry.stopping ||
+        entry.disconnected ||
+        !child.connected
+      )
+        return;
+      try {
+        child.send(envelope, error => {
+          if (error) this.handleTransportFailure(target, entry);
+        });
+      } catch {
+        this.handleTransportFailure(target, entry);
+      }
+    };
 
     if (this.handlers.has(action)) {
       const handler = this.handlers.get(action)!;
-      Promise.resolve(handler(data))
+      const context = Object.freeze({
+        target,
+        pid: child.pid,
+        requestId: id,
+        processInstanceId: entry.processInstanceId,
+      });
+      Promise.resolve()
+        .then(() => {
+          if (
+            this.processes.get(target) !== entry ||
+            entry.stopping ||
+            entry.disconnected ||
+            !child.connected
+          )
+            throw new PeepsyProcessError('IPC process unavailable', target);
+          return handler(data, context);
+        })
         .then(response => {
           const envelope: ResponseEnvelope = { type: 'RESPONSE', id, status: 200, data: response };
-          child.send(envelope);
+          send(envelope);
         })
         .catch(error => {
           const sanitized = sanitizeError(error);
@@ -399,8 +569,8 @@ export class PeepsyMaster extends EventEmitter {
               ? { name: 'Error', message: sanitized.message, stack: sanitized.stack }
               : { name: 'Error', message: sanitized.message },
           };
-          child.send(envelope);
-          this.logger.error(`Handler error for action ${action}`, sanitized);
+          send(envelope);
+          this.logger.error(`Handler error for action ${action}`, { target });
         });
     } else {
       const envelope: ResponseEnvelope = {
@@ -413,7 +583,7 @@ export class PeepsyMaster extends EventEmitter {
           message: `No handler registered for action: ${action}`,
         },
       };
-      child.send(envelope);
+      send(envelope);
       this.logger.warn(`No handler for action: ${action}`, { target });
     }
   }
@@ -425,23 +595,28 @@ export class PeepsyMaster extends EventEmitter {
     }
 
     const strategy = group.config.strategy ?? 'round-robin';
+    const targets = group.targets.filter(target => {
+      const entry = this.processes.get(target);
+      return entry && !entry.stopping && !entry.disconnected && entry.child.connected;
+    });
+    if (targets.length === 0) return undefined;
     let targetIndex: number;
 
     switch (strategy) {
       case 'round-robin': {
         const counter = this.roundRobinCounters.get(groupId) ?? 0;
-        targetIndex = counter % group.targets.length;
+        targetIndex = counter % targets.length;
         this.roundRobinCounters.set(groupId, counter + 1);
         break;
       }
 
       case 'random': {
-        targetIndex = Math.floor(Math.random() * group.targets.length);
+        targetIndex = Math.floor(Math.random() * targets.length);
         break;
       }
 
       case 'least-busy': {
-        targetIndex = this.getLeastBusyProcessIndex(group.targets);
+        targetIndex = this.getLeastBusyProcessIndex(targets);
         break;
       }
 
@@ -449,7 +624,7 @@ export class PeepsyMaster extends EventEmitter {
         throw new PeepsyError(`Unknown load balancing strategy: ${strategy}`);
     }
 
-    const target = group.targets[targetIndex];
+    const target = targets[targetIndex];
     return target ? this.processes.get(target) : undefined;
   }
 
@@ -571,87 +746,106 @@ export class PeepsyMaster extends EventEmitter {
     if (!processEntry) {
       throw new PeepsyNotFoundError(target);
     }
+    if (!isValidTimeout(timeout)) throw new PeepsyError('Invalid shutdown timeout');
+    return this.stopProcess(target, processEntry, timeout);
+  }
 
-    return new Promise((resolve, reject) => {
-      const { child } = processEntry;
-      let childExited = false;
+  public async terminateChild(target: string): Promise<void> {
+    const entry = this.processes.get(target);
+    if (!entry) throw new PeepsyNotFoundError(target);
+    return this.stopProcess(target, entry, 0);
+  }
 
+  private stopProcess(
+    target: string,
+    entry: ChildProcessEntry,
+    timeout: number,
+    intentional = true
+  ): Promise<void> {
+    if (intentional) entry.stopping = true;
+    this.rejectTargetRequests(target, entry);
+    const existing = this.stoppingProcesses.get(entry);
+    if (existing) {
+      if (timeout === 0) existing.forceKill();
+      return existing.promise;
+    }
+    const { child } = entry;
+    let forceKill!: () => void;
+    const stopped = new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let killed = false;
       const cleanup = (): void => {
-        child.removeAllListeners();
-        this.cleanupProcess(target);
+        if (timer) clearTimeout(timer);
+        child.removeListener('exit', onExit);
+        child.removeListener('close', onExit);
       };
-
       const onExit = (): void => {
-        if (childExited) return;
-        childExited = true;
         cleanup();
         resolve();
       };
-
-      const onError = (err: Error): void => {
-        if (childExited) return;
-        childExited = true;
-        cleanup();
-        reject(err);
-      };
-
-      child.once('exit', onExit);
-      child.once('error', onError);
-
-      // Try graceful shutdown first
-      if (child.connected) {
+      forceKill = (): void => {
+        if (killed) return;
+        killed = true;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new PeepsyProcessError('Termination was not confirmed within 2000ms', target));
+        }, 2000);
         try {
-          child.send({ type: 'SHUTDOWN' });
-        } catch (error) {
-          /* istanbul ignore next */
-          this.logger.warn(`Failed to send shutdown message to ${target}`, error);
+          child.kill('SIGKILL');
+        } catch {
+          this.logger.error(`Failed to kill child: ${target}`);
         }
-      }
-
-      // Force kill after timeout
-      const killTimeout = setTimeout(() => {
-        if (!childExited) {
-          this.logger.warn(`Force killing child process ${target} after timeout`);
-          try {
-            child.kill('SIGKILL');
-          } catch (error) {
-            /* istanbul ignore next */
-            this.logger.error(`Failed to kill child process ${target}`, error);
-          }
-        }
-      }, timeout);
-
-      child.once('exit', () => clearTimeout(killTimeout));
+      };
+      child.once('exit', onExit);
+      child.once('close', onExit);
+      timer = setTimeout(forceKill, timeout);
     });
+    this.stoppingProcesses.set(entry, { promise: stopped, forceKill });
+    void stopped.then(
+      () => this.stoppingProcesses.delete(entry),
+      () => this.stoppingProcesses.delete(entry)
+    );
+    if (timeout > 0 && child.connected) {
+      try {
+        child.send({ type: 'SHUTDOWN' }, error => {
+          if (error) this.handleTransportFailure(target, entry);
+        });
+      } catch {
+        this.handleTransportFailure(target, entry);
+      }
+    }
+    return stopped;
   }
 
-  public async gracefulShutdown(timeout: number = 30000): Promise<void> {
-    if (this.isShuttingDown) return;
-
+  public gracefulShutdown(timeout: number = 30000): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    if (!isValidTimeout(timeout))
+      return Promise.reject(new PeepsyError('Invalid shutdown timeout'));
     this.isShuttingDown = true;
-    this.logger.info('Starting graceful shutdown...');
-
-    const targets = Array.from(this.processes.keys());
-    const shutdownPromises = targets.map(target =>
-      this.shutdownChild(target, timeout / targets.length).catch(
-        /* istanbul ignore next */
-        error => this.logger.error(`Failed to shutdown child ${target}`, error)
-      )
-    );
-
-    try {
-      await Promise.allSettled(shutdownPromises);
+    PeepsyMaster.signalMasters.delete(this);
+    if (PeepsyMaster.signalMasters.size === 0) {
+      process.removeListener('SIGINT', PeepsyMaster.signalHandler);
+      process.removeListener('SIGTERM', PeepsyMaster.signalHandler);
+    }
+    if (this.healthMonitor) clearInterval(this.healthMonitor);
+    this.healthMonitor = undefined;
+    for (const groupId of this.groupQueues.keys()) this.rejectGroupQueue(groupId);
+    this.shutdownPromise = Promise.resolve().then(async () => {
+      const targets = [...this.processes.keys()];
+      const results = await Promise.allSettled(
+        targets.map(target =>
+          this.shutdownChild(target, Math.max(1, Math.floor(timeout / Math.max(1, targets.length))))
+        )
+      );
       this.logger.info('Graceful shutdown completed');
-    } catch (error) {
-      /* istanbul ignore next */
-      this.logger.error('Error during graceful shutdown', error);
-    }
-
-    this.removeAllListeners();
-    if (this.healthMonitor) {
-      clearInterval(this.healthMonitor);
-      this.healthMonitor = undefined;
-    }
+      this.removeAllListeners();
+      const failure = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected'
+      );
+      if (failure) throw failure.reason;
+    });
+    return this.shutdownPromise;
   }
 
   // Public getters for monitoring
@@ -707,6 +901,8 @@ export class PeepsyMaster extends EventEmitter {
     this.healthMonitor = setInterval(() => {
       const now = Date.now();
       for (const [target, stats] of this.processStats) {
+        const current = this.processes.get(target);
+        if (!current || current.stopping || current.disconnected) continue;
         const last = stats.lastHeartbeatAt ?? stats.lastActivity;
         if (!last) continue;
         const missed = now - last > this.heartbeatIntervalMs * this.heartbeatMissThreshold;
@@ -726,9 +922,9 @@ export class PeepsyMaster extends EventEmitter {
               this.logger.warn(`Auto-restart disabled for ${target}; not killing process`);
               this.emit('heartbeat-missed', { target, timestamp: now });
             }
-          } catch (err) {
+          } catch {
             /* istanbul ignore next */
-            this.logger.error(`Failed to kill unhealthy child ${target}`, err);
+            this.logger.error(`Failed to kill unhealthy child ${target}`);
           }
         } else {
           this.updateProcessStats(target, { status: 'healthy' });

@@ -13,12 +13,20 @@ import {
   PeepsyLogger,
   PeepsyError,
   PeepsyTimeoutError,
+  PeepsyProcessError,
 } from './types';
 import { PriorityQueue, DefaultLogger, delay, isValidTimeout, sanitizeError } from './utils';
 
 export class PeepsyChild {
   private readonly queue: PriorityQueue<RequestMessage> | null = null;
-  private readonly activeRequests: Map<string, (response: ResponseMessage) => void> = new Map();
+  private readonly activeRequests = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (response: unknown) => void;
+      reject: (error: Error) => void;
+    }
+  >();
   private readonly handlers: Map<string, (data: unknown) => Promise<unknown> | unknown> = new Map();
   private readonly logger: PeepsyLogger;
   private readonly mode: ProcessMode;
@@ -32,6 +40,7 @@ export class PeepsyChild {
   private queueCleanupInterval: ReturnType<typeof setInterval> | undefined = undefined;
   private requestsHandled: number = 0;
   private requestsInProgress: number = 0;
+  private readonly processListeners: Array<[string, (...args: any[]) => void]> = [];
 
   constructor(mode: ProcessMode = 'sequential', options: PeepsyOptions = {}) {
     this.mode = mode;
@@ -44,6 +53,8 @@ export class PeepsyChild {
     if (!isValidTimeout(this.timeout)) {
       throw new PeepsyError('Invalid timeout value. Must be a positive integer <= 300000ms');
     }
+    if (!process.send)
+      throw new PeepsyError('This Node.js script was not spawned with an IPC channel');
 
     if (
       mode === 'sequential' ||
@@ -56,7 +67,7 @@ export class PeepsyChild {
     }
 
     this.setupMessageHandlers();
-    this.setupProcessHandlers();
+    this.setupProcessHandlers(options.handleSignals !== false);
     this.startHeartbeat();
 
     this.logger.debug(`PeepsyChild initialized in ${mode} mode`);
@@ -67,7 +78,7 @@ export class PeepsyChild {
       throw new PeepsyError('This Node.js script was not spawned with an IPC channel');
     }
 
-    process.on('message', (message: any) => {
+    this.addProcessListener('message', (message: any) => {
       try {
         if (this.isShuttingDown) return;
 
@@ -99,36 +110,39 @@ export class PeepsyChild {
             void this.processRequestImmediately(req);
           }
         } else if (message?.type === 'RESPONSE' && this.activeRequests.has(message.id)) {
-          const resolve = this.activeRequests.get(message.id);
-          if (resolve) {
-            resolve(message);
-            this.activeRequests.delete(message.id);
-          }
+          this.settleRequest(message.id, message);
         } else if (message?.type === 'SHUTDOWN') {
           void this.gracefulShutdown();
         }
-      } catch (error) {
-        this.logger.error('Error handling message from master', error);
+      } catch {
+        this.logger.error('Error handling message from master');
       }
     });
   }
 
-  private setupProcessHandlers(): void {
+  private addProcessListener(event: string, listener: (...args: any[]) => void): void {
+    this.processListeners.push([event, listener]);
+    process.on(event, listener);
+  }
+
+  private setupProcessHandlers(handleSignals: boolean): void {
     const shutdown = (): void => {
       void this.gracefulShutdown();
     };
 
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
-    process.on('disconnect', shutdown);
+    if (handleSignals) {
+      this.addProcessListener('SIGINT', shutdown);
+      this.addProcessListener('SIGTERM', shutdown);
+    }
+    this.addProcessListener('disconnect', shutdown);
 
-    process.on('uncaughtException', (error: Error) => {
-      this.logger.error('Uncaught exception in child process', error);
+    this.addProcessListener('uncaughtException', () => {
+      this.logger.error('Uncaught exception in child process');
       void this.gracefulShutdown();
     });
 
-    process.on('unhandledRejection', (reason: unknown) => {
-      this.logger.error('Unhandled rejection in child process', reason);
+    this.addProcessListener('unhandledRejection', () => {
+      this.logger.error('Unhandled rejection in child process');
     });
   }
 
@@ -138,13 +152,18 @@ export class PeepsyChild {
     this.heartbeatTimer = setInterval(() => {
       try {
         const sendFn = process.send;
-        if (sendFn) {
-          sendFn({
-            type: 'HEARTBEAT',
-            pid: process.pid,
-            timestamp: Date.now(),
-            requestsActive: this.requestsInProgress,
-          } as any);
+        if (sendFn && process.connected !== false && !this.isShuttingDown) {
+          sendFn(
+            {
+              type: 'HEARTBEAT',
+              pid: process.pid,
+              timestamp: Date.now(),
+              requestsActive: this.requestsInProgress,
+            } as any,
+            undefined,
+            undefined,
+            () => undefined
+          );
         }
       } catch (err) {
         void err;
@@ -214,7 +233,7 @@ export class PeepsyChild {
         lastError = error instanceof Error ? error : new Error(String(error));
         this.logger.warn(`Request attempt ${attempt + 1} failed`, {
           action,
-          error: sanitizeError(error),
+          code: error instanceof PeepsyError ? error.code : 'PEEPSY_PROCESS',
         });
       }
     }
@@ -224,38 +243,56 @@ export class PeepsyChild {
 
   private async executeRequest(action: string, data: unknown, timeout: number): Promise<unknown> {
     return new Promise((resolve, reject) => {
+      if (this.isShuttingDown || !process.send || process.connected === false) {
+        reject(new PeepsyProcessError('No IPC channel available'));
+        return;
+      }
       const id = randomUUID();
 
       const timeoutHandle = setTimeout(() => {
-        this.activeRequests.delete(id);
-        reject(new PeepsyTimeoutError(timeout));
+        this.settleRequest(id, undefined, new PeepsyTimeoutError(timeout));
       }, timeout);
 
-      this.activeRequests.set(id, (response: ResponseMessage) => {
-        clearTimeout(timeoutHandle);
-        if (response.error) {
-          reject(new PeepsyError(response.error));
-        } else {
-          resolve(response.data);
-        }
-      });
-
-      if (!process.send) {
-        clearTimeout(timeoutHandle);
-        this.activeRequests.delete(id);
-        reject(new PeepsyError('No IPC channel available'));
-        return;
-      }
+      this.activeRequests.set(id, { timer: timeoutHandle, resolve, reject });
 
       try {
         const envelope: RequestEnvelope = { type: 'REQUEST', id, action, data, timeout };
-        process.send(envelope);
+        process.send(envelope, undefined, undefined, error => {
+          if (error) this.settleRequest(id, undefined, error);
+        });
       } catch (error) {
-        clearTimeout(timeoutHandle);
-        this.activeRequests.delete(id);
-        reject(error);
+        this.settleRequest(
+          id,
+          undefined,
+          error instanceof Error ? error : new PeepsyProcessError('IPC send failed')
+        );
       }
     });
+  }
+
+  private settleRequest(id: string, response?: ResponseMessage, error?: Error): void {
+    const pending = this.activeRequests.get(id);
+    if (!pending) return;
+    this.activeRequests.delete(id);
+    clearTimeout(pending.timer);
+    const failure =
+      error ??
+      (response && (response.error || response.status >= 400)
+        ? new PeepsyError(response.error ?? `Request failed with status ${response.status}`)
+        : undefined);
+    if (failure) pending.reject(failure);
+    else pending.resolve(response?.data);
+  }
+
+  private sendResponse(envelope: ResponseEnvelope): void {
+    if (!process.send || process.connected === false || this.isShuttingDown) return;
+    try {
+      process.send(envelope, undefined, undefined, error => {
+        if (error) this.logger.warn('IPC response send failed');
+      });
+    } catch {
+      this.logger.warn('IPC response send failed');
+    }
   }
 
   private enqueueRequest(request: RequestMessage, timeout: number): void {
@@ -282,8 +319,8 @@ export class PeepsyChild {
           await this.processRequest(request);
         }
       }
-    } catch (error) {
-      this.logger.error('Error processing queue', error);
+    } catch {
+      this.logger.error('Error processing queue');
     } finally {
       this.isProcessing = false;
     }
@@ -306,15 +343,15 @@ export class PeepsyChild {
     try {
       this.requestsInProgress++;
       await this.processRequest(request);
-    } catch (error) {
-      this.logger.error('Error processing immediate request', error);
+    } catch {
+      this.logger.error('Error processing immediate request');
     } finally {
       this.requestsInProgress--;
     }
   }
 
   private async processRequest(request: RequestMessage): Promise<void> {
-    if (!process.send) {
+    if (!process.send || process.connected === false || this.isShuttingDown) {
       this.logger.error('No IPC channel available for response');
       return;
     }
@@ -323,7 +360,7 @@ export class PeepsyChild {
     const handler = this.handlers.get(action);
 
     if (!handler) {
-      process.send({
+      this.sendResponse({
         type: 'RESPONSE',
         id,
         status: 404,
@@ -339,7 +376,7 @@ export class PeepsyChild {
       const duration = Date.now() - startTime;
 
       const env: ResponseEnvelope = { type: 'RESPONSE', id, status: 200, data: result };
-      process.send(env);
+      this.sendResponse(env);
 
       this.requestsHandled++;
       this.logger.debug(`Request processed successfully`, {
@@ -357,12 +394,11 @@ export class PeepsyChild {
         status: 500,
         error: sanitized.message,
       };
-      process.send(env);
+      this.sendResponse(env);
 
       this.logger.error(`Request processing failed`, {
         action,
         duration,
-        error: sanitized,
       });
     }
   }
@@ -394,6 +430,9 @@ export class PeepsyChild {
     if (this.isShuttingDown) return;
 
     this.isShuttingDown = true;
+    for (const id of this.activeRequests.keys()) {
+      this.settleRequest(id, undefined, new PeepsyProcessError('IPC process shutting down'));
+    }
     this.logger.info('Starting graceful shutdown...');
 
     // Stop accepting new requests
@@ -418,10 +457,8 @@ export class PeepsyChild {
     this.queue?.clear();
 
     // Clean up listeners
-    process.removeAllListeners('message');
-    process.removeAllListeners('disconnect');
-    process.removeAllListeners('SIGINT');
-    process.removeAllListeners('SIGTERM');
+    for (const [event, listener] of this.processListeners) process.removeListener(event, listener);
+    this.processListeners.length = 0;
 
     this.logger.info(`Child process shutting down. Handled ${this.requestsHandled} requests.`);
 
@@ -445,6 +482,10 @@ export class PeepsyChild {
   // Public getters for monitoring
   public getRequestsHandled(): number {
     return this.requestsHandled;
+  }
+
+  public getActiveRequestsCount(): number {
+    return this.activeRequests.size;
   }
 
   public getRequestsInProgress(): number {

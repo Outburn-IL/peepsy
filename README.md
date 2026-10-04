@@ -353,7 +353,7 @@ const master = new PeepsyMaster({
 ### Graceful Shutdown
 
 ```javascript
-const master = new PeepsyMaster();
+const master = new PeepsyMaster({ handleSignals: false });
 
 // Handle shutdown signals
 process.on('SIGINT', async () => {
@@ -374,6 +374,74 @@ await master.shutdownChild('worker1', 10000); // 10 second timeout
 // disconnecting IPC and allowing natural exit to avoid test runner warnings.
 ```
 
+### Supervised Workers
+
+Master handlers accept an optional second argument, `PeepsyRequestContext`,
+with `target`, `pid`, `requestId` and `processInstanceId`. Peepsy derives the
+sender from the connected child process, not from request data. The context is
+frozen; its generation UUID changes whenever the same target is spawned again.
+Existing one-argument handlers remain supported.
+
+```javascript
+const master = new PeepsyMaster({ handleSignals: false });
+master.registerHandler('identify', (_data, context) => ({
+  target: context.target,
+  generation: context.processInstanceId
+}));
+
+master.spawnChild('worker', './worker.js', 'concurrent', undefined, {
+  execArgv: [],
+  stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+  inheritEnv: false,
+  env: { WORKER_LABEL: 'worker' },
+  disableAutoRestart: true
+});
+
+master.on('exit', ({ target, processInstanceId, code, signal, intentional }) => {
+  console.log({ target, processInstanceId, code, signal, intentional });
+});
+
+await master.terminateChild('worker');
+await master.gracefulShutdown();
+```
+
+| Spawn Option | Default and Behavior |
+|--------------|----------------------|
+| `execPath` | Node's default executable; forwarded to `fork` |
+| `execArgv` | Node's inherited arguments; `[]` disables their inheritance |
+| `stdio` | Node's default fork stdio; custom configurations must include an IPC channel |
+| `silent` | Node's default (`false`); forwarded to `fork` |
+| `env` | Explicit variables merged with the parent environment by default |
+| `inheritEnv` | `true`; `false` passes only `env` (or an empty environment), so supply any required OS/runtime variables explicitly |
+| `disableAutoRestart` | `false`; either the target or group can disable unexpected-exit recovery |
+
+Both master and child default to `handleSignals: true`. Set it to `false` when
+the embedding application owns SIGINT/SIGTERM. Master instances share signal
+listeners and unregister them after the last participating master shuts down;
+child shutdown removes only listeners owned by that child instance.
+
+`spawn` events retain their existing fields and add `processInstanceId`. `exit`
+events expose `PeepsyExitEvent`: target, generation UUID, exit code, signal and
+whether the stop was intentional. Replies and requests from replaced or
+disconnected children are ignored.
+
+`shutdownChild(target, timeout)` sends a graceful shutdown request, then
+force-kills after the timeout. `terminateChild(target)` force-kills without
+waiting for a grace period and accelerates an existing graceful stop. Both
+reject pending target requests immediately, suppress auto-restart, and resolve
+only after exit/close cleanup is confirmed. If force-kill cannot be confirmed
+within a further 2000ms, they reject with `PeepsyProcessError` and retain tracked
+ownership until a later exit/close event. `gracefulShutdown` is idempotent and
+propagates unconfirmed termination failures.
+
+Timeouts and failed sends clear pending request timers and release group
+capacity. Disconnect, exit and intentional stop reject associated pending
+requests. The child applies the same cleanup to child-initiated requests and
+does not send late results on closed IPC. `getActiveRequestsCount()` is
+available on both master and child. Internal transport/handler logs omit raw
+errors and payloads; the existing response error protocol is unchanged and
+applications remain responsible for sanitizing peer-visible errors.
+
 ## 📚 API Reference
 
 ### PeepsyMaster
@@ -389,9 +457,11 @@ new PeepsyMaster(options?: PeepsyOptions)
 |--------|-------------|
 | `spawnChild(target, scriptPath, mode, groupId?, options?)` | Spawn a new child process |
 | `sendRequest(action, targetOrGroup, data?, options?)` | Send request to child process |
-| `registerHandler(action, handler)` | Register handler for child requests |
+| `registerHandler(action, handler)` | Register `(data, context)` handler for child requests |
 | `shutdownChild(target, timeout?)` | Shutdown specific child process |
+| `terminateChild(target)` | Force-stop a child and await confirmed cleanup |
 | `gracefulShutdown(timeout?)` | Shutdown all child processes |
+| `getActiveRequestsCount()` | Count outstanding master-initiated requests |
 | `getProcessStats(target)` | Get statistics for specific process |
 | `getGroupStats(groupId)` | Get statistics for process group |
 | `isProcessAlive(target)` | Check if process is running |
@@ -409,6 +479,7 @@ new PeepsyChild(mode?: ProcessMode, options?: PeepsyOptions)
 |--------|-------------|
 | `registerHandler(action, handler)` | Register request handler |
 | `sendRequest(action, data?, options?)` | Send request to master |
+| `getActiveRequestsCount()` | Count outstanding child-initiated requests |
 | `getRequestsHandled()` | Get number of requests processed |
 | `getQueueSize()` | Get current queue size (sequential mode) |
 | `isActive()` | Check if child is active |

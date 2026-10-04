@@ -24,6 +24,8 @@ export {
   ProcessStats,
   GroupStats,
   PeepsyEvent,
+  PeepsyRequestContext,
+  PeepsyExitEvent,
 
   // Error classes
   PeepsyError,
