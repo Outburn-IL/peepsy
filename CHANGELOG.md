@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0]
 
 ### Added
 - Spawn controls for `execArgv`, fork-compatible `stdio`, `inheritEnv` and per-target `disableAutoRestart`.
 - Optional signal ownership via `handleSignals` on master and child.
 - Frozen transport-derived master handler context and per-spawn generation identities on spawn/exit events.
 - Confirmed `terminateChild` cleanup, bounded termination failures and child pending-request counts.
+- API guidance for transport-derived sender generations, spawn environment/argument isolation, signal ownership, confirmed termination and master/child response shapes.
 
 ### Fixed
 - Settle pending requests and clear timers exactly once on timeout, failed send, disconnect, exit and shutdown.
