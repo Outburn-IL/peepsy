@@ -21,14 +21,7 @@ describe('PeepsyChild', () => {
 
   beforeEach(() => {
     // Mock process methods
-    global.process = {
-      ...originalProcess,
-      send: mockProcess.send,
-      on: mockProcess.on,
-      removeListener: mockProcess.removeListener,
-      removeAllListeners: mockProcess.removeAllListeners,
-      exit: mockProcess.exit,
-    } as any;
+    global.process = Object.create(originalProcess, Object.getOwnPropertyDescriptors(mockProcess));
     mockProcess.send.mockClear();
     mockProcess.on.mockClear();
     mockProcess.removeListener.mockClear();
