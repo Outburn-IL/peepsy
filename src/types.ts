@@ -5,7 +5,7 @@
  * @license MIT
  */
 
-import { ChildProcess } from 'child_process';
+import { ChildProcess, ForkOptions } from 'child_process';
 
 export interface RequestMessage {
   readonly id: string;
@@ -49,6 +49,9 @@ export interface PeepsyErrorPayload {
 
 export interface ChildProcessEntry {
   readonly child: ChildProcess;
+  readonly processInstanceId: string;
+  stopping?: boolean;
+  disconnected?: boolean;
   readonly mode: ProcessMode;
   readonly scriptPath?: string;
   readonly groupId?: string;
@@ -66,6 +69,25 @@ export interface SpawnOptions {
   readonly execPath?: string;
   readonly silent?: boolean;
   readonly env?: Record<string, string>;
+  readonly execArgv?: string[];
+  readonly stdio?: ForkOptions['stdio'];
+  readonly inheritEnv?: boolean;
+  readonly disableAutoRestart?: boolean;
+}
+
+export interface PeepsyRequestContext {
+  readonly target: string;
+  readonly pid: number | undefined;
+  readonly requestId: string;
+  readonly processInstanceId: string;
+}
+
+export interface PeepsyExitEvent {
+  readonly target: string;
+  readonly processInstanceId: string;
+  readonly code: number | null;
+  readonly signal: ChildProcess['signalCode'];
+  readonly intentional: boolean;
 }
 
 export interface GroupConfig {
@@ -85,6 +107,7 @@ export interface PeepsyLogger {
 }
 
 export interface PeepsyOptions {
+  readonly handleSignals?: boolean;
   readonly timeout?: number;
   readonly logger?: PeepsyLogger;
   readonly maxRetries?: number;
@@ -126,7 +149,8 @@ export interface GroupStats {
 }
 
 export interface PeepsyEvent {
-  readonly type: 'request' | 'response' | 'error' | 'spawn' | 'shutdown';
+  readonly type: 'request' | 'response' | 'error' | 'spawn' | 'shutdown' | 'exit';
+  readonly processInstanceId?: string;
   readonly timestamp: number;
   readonly target?: string;
   readonly group?: string;

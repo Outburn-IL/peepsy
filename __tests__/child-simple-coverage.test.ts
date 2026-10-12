@@ -8,6 +8,7 @@ import { PeepsyChild } from '../src/index';
 const mockProcess = {
   send: jest.fn(),
   on: jest.fn(),
+  removeListener: jest.fn(),
   removeAllListeners: jest.fn(),
   exit: jest.fn(),
   disconnect: jest.fn(),
@@ -20,15 +21,7 @@ const originalProcess = global.process;
 describe('PeepsyChild Coverage Tests', () => {
   beforeEach(() => {
     // Mock process methods
-    global.process = {
-      ...originalProcess,
-      send: mockProcess.send,
-      on: mockProcess.on,
-      removeAllListeners: mockProcess.removeAllListeners,
-      exit: mockProcess.exit,
-      disconnect: mockProcess.disconnect,
-      pid: mockProcess.pid,
-    } as any;
+    global.process = Object.create(originalProcess, Object.getOwnPropertyDescriptors(mockProcess));
     jest.clearAllMocks();
   });
 
@@ -54,7 +47,7 @@ describe('PeepsyChild Coverage Tests', () => {
     });
 
     it('should throw error without IPC channel', () => {
-      global.process = { ...originalProcess, send: undefined } as any;
+      global.process = Object.assign(Object.create(originalProcess), { send: undefined });
       expect(() => new PeepsyChild('sequential')).toThrow(
         'This Node.js script was not spawned with an IPC channel'
       );
@@ -100,20 +93,19 @@ describe('PeepsyChild Coverage Tests', () => {
       expect(() => messageHandler(requestMessage)).not.toThrow();
     });
 
-    it('should handle RESPONSE message with active request', () => {
+    it('should handle RESPONSE message with active request', async () => {
+      const pending = child.sendRequest('test', {});
+      const request = mockProcess.send.mock.calls[mockProcess.send.mock.calls.length - 1]![0];
       const responseMessage = {
         type: 'RESPONSE',
-        id: 'response-1',
+        id: request.id,
+        status: 200,
         data: { result: 'success' },
       };
 
-      // Add an active request to respond to
-      const mockResolve = jest.fn();
-      (child as any).activeRequests.set('response-1', mockResolve);
-
       messageHandler(responseMessage);
-      expect(mockResolve).toHaveBeenCalledWith(responseMessage);
-      expect((child as any).activeRequests.has('response-1')).toBe(false);
+      await expect(pending).resolves.toEqual(responseMessage.data);
+      expect(child.getActiveRequestsCount()).toBe(0);
     });
 
     it('should handle SHUTDOWN message', () => {
@@ -202,7 +194,7 @@ describe('PeepsyChild Coverage Tests', () => {
         pid: 12345,
         timestamp: expect.any(Number),
         requestsActive: 0,
-      });
+      }, undefined, undefined, expect.any(Function));
     });
 
     it('should handle heartbeat send errors gracefully', () => {
@@ -259,6 +251,46 @@ describe('PeepsyChild Coverage Tests', () => {
       });
 
       await expect((child as any).executeRequest('test', {}, 1000)).rejects.toThrow('Send failed');
+    });
+
+    it('should retry a failed send and settle the successful response', async () => {
+      const retryingChild = new PeepsyChild('sequential', { retryDelay: 10 });
+      const messageHandler = mockProcess.on.mock.calls.filter(call => call[0] === 'message').at(-1)![1];
+      mockProcess.send
+        .mockImplementationOnce(() => {
+          throw new Error('Temporary send failure');
+        })
+        .mockImplementationOnce(message => {
+          messageHandler({ type: 'RESPONSE', id: message.id, status: 200, data: 'retried' });
+        });
+      try {
+        await expect(retryingChild.sendRequest('test', {}, { retries: 1 })).resolves.toBe('retried');
+        expect(retryingChild.getActiveRequestsCount()).toBe(0);
+      } finally {
+        await (retryingChild as any).gracefulShutdown();
+      }
+    });
+
+    it('should settle IPC callback failure once and ignore a late response', async () => {
+      mockProcess.send.mockImplementationOnce((message, _handle, _options, callback) => {
+        callback(new Error('Callback send failure'));
+        const messageHandler = mockProcess.on.mock.calls.find(call => call[0] === 'message')![1];
+        messageHandler({ type: 'RESPONSE', id: message.id, status: 200, data: 'late' });
+      });
+      await expect(child.sendRequest('test')).rejects.toThrow('Callback send failure');
+      expect(child.getActiveRequestsCount()).toBe(0);
+    });
+
+    it.each(['callback', 'throw'])('should safely log response send %s failures', failure => {
+      const logger = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+      const respondingChild = new PeepsyChild('sequential', { logger });
+      mockProcess.send.mockImplementationOnce((_message, _handle, _options, callback) => {
+        if (failure === 'throw') throw new Error('private-send-error');
+        callback(new Error('private-send-error'));
+      });
+      expect(() => (respondingChild as any).sendResponse({ id: 'response', status: 200 })).not.toThrow();
+      expect(logger.warn).toHaveBeenCalledWith('IPC response send failed');
+      expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('private-send-error');
     });
   });
 

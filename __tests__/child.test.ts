@@ -8,6 +8,7 @@ import { PeepsyChild, PeepsyError } from '../src/index';
 const mockProcess = {
   send: jest.fn(),
   on: jest.fn(),
+  removeListener: jest.fn(),
   removeAllListeners: jest.fn(),
   exit: jest.fn(),
 };
@@ -20,22 +21,18 @@ describe('PeepsyChild', () => {
 
   beforeEach(() => {
     // Mock process methods
-    global.process = {
-      ...originalProcess,
-      send: mockProcess.send,
-      on: mockProcess.on,
-      removeAllListeners: mockProcess.removeAllListeners,
-      exit: mockProcess.exit,
-    } as any;
+    global.process = Object.create(originalProcess, Object.getOwnPropertyDescriptors(mockProcess));
     mockProcess.send.mockClear();
     mockProcess.on.mockClear();
+    mockProcess.removeListener.mockClear();
     mockProcess.removeAllListeners.mockClear();
     mockProcess.exit.mockClear();
 
     child = new PeepsyChild('sequential');
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await (child as any).gracefulShutdown(1);
     // Restore original process
     global.process = originalProcess;
   });
@@ -59,7 +56,7 @@ describe('PeepsyChild', () => {
     });
 
     it('should throw error without IPC channel', () => {
-      global.process = { ...originalProcess, send: undefined } as any;
+      global.process = { ...global.process, send: undefined } as any;
       expect(() => new PeepsyChild('sequential')).toThrow(PeepsyError);
     });
   });
@@ -110,12 +107,17 @@ describe('PeepsyChild', () => {
       // Simulate message processing
       await (child as any).processRequest(request);
 
-      expect(mockProcess.send).toHaveBeenCalledWith({
-        type: 'RESPONSE',
-        id: '1',
-        status: 200,
-        data: { echoed: { message: 'hello' } },
-      });
+      expect(mockProcess.send).toHaveBeenCalledWith(
+        {
+          type: 'RESPONSE',
+          id: '1',
+          status: 200,
+          data: { echoed: { message: 'hello' } },
+        },
+        undefined,
+        undefined,
+        expect.any(Function)
+      );
     });
 
     it('should process async handlers', async () => {
@@ -123,12 +125,17 @@ describe('PeepsyChild', () => {
 
       await (child as any).processRequest(request);
 
-      expect(mockProcess.send).toHaveBeenCalledWith({
-        type: 'RESPONSE',
-        id: '2',
-        status: 200,
-        data: { completed: 'test-task' },
-      });
+      expect(mockProcess.send).toHaveBeenCalledWith(
+        {
+          type: 'RESPONSE',
+          id: '2',
+          status: 200,
+          data: { completed: 'test-task' },
+        },
+        undefined,
+        undefined,
+        expect.any(Function)
+      );
     });
 
     it('should handle errors in handlers', async () => {
@@ -136,12 +143,17 @@ describe('PeepsyChild', () => {
 
       await (child as any).processRequest(request);
 
-      expect(mockProcess.send).toHaveBeenCalledWith({
-        type: 'RESPONSE',
-        id: '3',
-        status: 500,
-        error: 'Handler error',
-      });
+      expect(mockProcess.send).toHaveBeenCalledWith(
+        {
+          type: 'RESPONSE',
+          id: '3',
+          status: 500,
+          error: 'Handler error',
+        },
+        undefined,
+        undefined,
+        expect.any(Function)
+      );
     });
 
     it('should handle unknown actions', async () => {
@@ -149,12 +161,17 @@ describe('PeepsyChild', () => {
 
       await (child as any).processRequest(request);
 
-      expect(mockProcess.send).toHaveBeenCalledWith({
-        type: 'RESPONSE',
-        id: '4',
-        status: 404,
-        error: 'No handler registered for action: unknown',
-      });
+      expect(mockProcess.send).toHaveBeenCalledWith(
+        {
+          type: 'RESPONSE',
+          id: '4',
+          status: 404,
+          error: 'No handler registered for action: unknown',
+        },
+        undefined,
+        undefined,
+        expect.any(Function)
+      );
     });
   });
 
@@ -198,7 +215,7 @@ describe('PeepsyChild', () => {
 
       // Simulate receiving response
       setTimeout(() => {
-        (child as any).activeRequests.get(sentMessage.id)?.(responseMessage);
+        mockProcess.on.mock.calls.find(([event]) => event === 'message')![1](responseMessage);
       }, 10);
 
       const result = await responsePromise;
@@ -217,7 +234,7 @@ describe('PeepsyChild', () => {
       };
 
       setTimeout(() => {
-        (child as any).activeRequests.get(sentMessage.id)?.(errorResponse);
+        mockProcess.on.mock.calls.find(([event]) => event === 'message')![1](errorResponse);
       }, 10);
 
       await expect(responsePromise).rejects.toThrow('Test error');
@@ -227,6 +244,66 @@ describe('PeepsyChild', () => {
       const responsePromise = child.sendRequest('test-action', { data: 'test' }, { timeout: 100 });
 
       await expect(responsePromise).rejects.toThrow('Request timed out');
+      expect(child.getActiveRequestsCount()).toBe(0);
+    });
+
+    it('clears timers for synchronous and callback send failures', async () => {
+      jest.useFakeTimers();
+      try {
+        const timers = jest.getTimerCount();
+        mockProcess.send.mockImplementationOnce(() => {
+          throw new Error('serialization failed');
+        });
+        await expect(child.sendRequest('test', {})).rejects.toThrow('serialization failed');
+        expect(child.getActiveRequestsCount()).toBe(0);
+        expect(jest.getTimerCount()).toBe(timers);
+        mockProcess.send.mockImplementationOnce((_message, _handle, _options, callback) =>
+          callback(new Error('callback failed'))
+        );
+        await expect(child.sendRequest('test', {})).rejects.toThrow('callback failed');
+        expect(child.getActiveRequestsCount()).toBe(0);
+        expect(jest.getTimerCount()).toBe(timers);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('settles pending requests on shutdown and removes only owned listeners', async () => {
+      const pending = child.sendRequest('test', {});
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'PEEPSY_PROCESS' });
+      await (child as any).gracefulShutdown(1);
+      await rejected;
+      expect(child.getActiveRequestsCount()).toBe(0);
+      expect(mockProcess.removeAllListeners).not.toHaveBeenCalled();
+      for (const [event, listener] of mockProcess.on.mock.calls) {
+        expect(mockProcess.removeListener).toHaveBeenCalledWith(event, listener);
+      }
+    });
+
+    it('discards late results after the channel disconnects', async () => {
+      let finish!: (value: string) => void;
+      child.registerHandler(
+        'late',
+        () =>
+          new Promise<string>(resolve => {
+            finish = resolve;
+          })
+      );
+      const pending = (child as any).processRequest({ id: 'late', action: 'late' });
+      global.process.connected = false;
+      finish('private-result');
+      await pending;
+      expect(mockProcess.send).not.toHaveBeenCalled();
+    });
+
+    it('can disable signal ownership while retaining disconnect handling', () => {
+      mockProcess.on.mockClear();
+      const isolated = new PeepsyChild('concurrent', { handleSignals: false });
+      expect(mockProcess.on.mock.calls.map(([event]) => event)).not.toEqual(
+        expect.arrayContaining(['SIGINT', 'SIGTERM'])
+      );
+      expect(mockProcess.on.mock.calls.map(([event]) => event)).toContain('disconnect');
+      void (isolated as any).gracefulShutdown(1);
     });
   });
 
