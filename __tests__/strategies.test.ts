@@ -61,12 +61,16 @@ describe('Load-balancing strategies', () => {
     await master.gracefulShutdown();
   });
 
-  test('unknown strategy throws', () => {
+  test('unknown strategy throws', async () => {
     const master = new PeepsyMaster({
       logger: { debug() {}, info() {}, warn() {}, error() {} } as any,
     });
-    master.spawnChild('a', workerPath, 'sequential', 'g');
-    expect(() => master.configureGroup('g', { strategy: 'hey' } as any)).not.toThrow();
-    expect(() => (master as any).getChildForGroup('g')).toThrow(PeepsyError);
+    try {
+      master.spawnChild('a', workerPath, 'sequential', 'g');
+      expect(() => master.configureGroup('g', { strategy: 'hey' } as any)).not.toThrow();
+      expect(() => (master as any).getChildForGroup('g')).toThrow(PeepsyError);
+    } finally {
+      await master.gracefulShutdown();
+    }
   });
 });
