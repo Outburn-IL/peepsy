@@ -270,6 +270,62 @@ const info = await child.sendRequest<{ who: string }, { ok: boolean }>('getMaste
 });
 ```
 
+### Sender Identity and Lifecycle Ownership (v1.1.0)
+
+Master handlers receive a second, frozen `PeepsyRequestContext` argument:
+
+```typescript
+master.registerHandler('readOwnedData', async (data, context) => {
+  const { target, pid, requestId, processInstanceId } = context;
+  return { target, pid, requestId, processInstanceId };
+});
+```
+
+These values come from the actual IPC child connection, never the request body.
+Use both target and `processInstanceId` when fencing capabilities: reusing a target
+after restart creates a new generation. `pid` may be undefined during failed
+startup; target/PID alone is not generation identity. One-argument handlers remain
+compatible. Master `sendRequest` returns a response envelope (`status`, `.data`);
+child `sendRequest` resolves the master's returned data directly.
+
+`spawnChild` accepts the following fifth-argument controls:
+
+| Option | Behavior |
+|---|---|
+| `execPath` | Select a fork-compatible executable; default is Node's normal fork executable. |
+| `execArgv` | Explicit executable arguments, including `[]` to avoid inherited inspector/runtime flags. |
+| `stdio` | Fork-compatible stdio array; include exactly one IPC channel. |
+| `inheritEnv` | Defaults to inherited behavior; `false` uses only supplied `env`. |
+| `env` | Environment values to merge, or the complete environment when inheritance is disabled. |
+| `disableAutoRestart` | Suppress target restart; group controls also apply. |
+
+```typescript
+master.spawnChild('owned-worker', './worker.js', 'concurrent', 'owned', {
+  execArgv: [],
+  stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+  inheritEnv: false,
+  env: { SystemRoot: process.env.SystemRoot ?? '' },
+  disableAutoRestart: true
+});
+```
+
+Provide any OS-required environment explicitly; a minimal environment is not a
+sandbox. `handleSignals: false` on master/child options lets an embedding host own
+SIGINT/SIGTERM while Peepsy still handles transport cleanup. `terminateChild(target)`
+forces termination and awaits confirmation; a missing target rejects, and a kill
+not confirmed within the bounded follow-up window rejects. Intentional stops do
+not auto-restart. `gracefulShutdown(timeout)` is idempotent, bounded and can be
+accelerated by explicit termination.
+
+`spawn` events include `target`, `processInstanceId` and timestamp. `exit` events
+include `target`, `processInstanceId`, code, signal and `intentional`; fence stale
+results/events with the generation. `PeepsyChild.getPendingRequestCount()` reports
+child-initiated pending requests. Timeouts, send failures, disconnect/exit and
+shutdown settle requests and clear timers exactly once; already-started handler
+work is not automatically cancelled. Set retries explicitly when replay would be
+unsafe. Internal lifecycle logs omit raw request payloads, callback errors and
+spawn environment/options; application code still owns its own log redaction.
+
 ### Process Monitoring
 
 ```javascript
